@@ -144,8 +144,8 @@ struct ExecArgs {
     #[command(flatten)]
     common: CommonRunArgs,
     /// Also record environment variables with this name; a trailing `*` matches a prefix.
-    /// Names containing KEY, TOKEN, SECRET, PASSWORD, PASSWD, AUTH, COOKIE or CREDENTIAL are
-    /// never recorded.
+    /// Names containing KEY, TOKEN, SECRET, PASS, AUTH, COOKIE, CREDENTIAL or PRIVATE, or with
+    /// a PAT or PWD part (`GITHUB_PAT`), are never recorded.
     #[arg(long = "env", value_name = "NAME")]
     env: Vec<String>,
     /// Record `uv run --no-project python --version`.
@@ -186,7 +186,7 @@ enum RunAction {
         /// Compare JSON, JSON Lines, CSV and TSV outputs value by value, not only byte-wise.
         #[arg(long)]
         compare: bool,
-        /// Run in the original directory, overwriting its outputs (they are copied first).
+        /// Run in the original directory; its outputs are moved to the baseline first.
         #[arg(long)]
         in_place: bool,
         /// Scratch directory for the copy (default: <state_dir>/reruns/<id>-<time>).
@@ -198,7 +198,7 @@ enum RunAction {
         /// Absolute tolerance.
         #[arg(long, default_value_t = 0.0)]
         atol: f64,
-        /// Do not pass the command's output through to the terminal.
+        /// Do not pass the command's output through (with --format jsonl it goes to stderr).
         #[arg(long)]
         quiet: bool,
         #[command(flatten)]
@@ -235,8 +235,19 @@ fn main() -> ExitCode {
     match dispatch(cli) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            let _ = writeln!(io::stderr(), "prov: error: {e:#}");
-            ExitCode::from(2)
+            let mut err = io::stderr().lock();
+            let _ = writeln!(err, "prov: error: {e:#}");
+            match e.downcast_ref::<run::AfterStart>() {
+                // The command ran; 125 keeps prov's failure apart from the command's status.
+                Some(after) => {
+                    if let Some(record) = &after.record {
+                        let _ = writeln!(err, "prov: the unsaved run record follows");
+                        let _ = err.write_all(record.as_bytes());
+                    }
+                    ExitCode::from(125)
+                }
+                None => ExitCode::from(2),
+            }
         }
     }
 }
@@ -278,7 +289,12 @@ fn dispatch(cli: Cli) -> Result<u8> {
                         cli.config.as_deref(),
                         common.state_dir.as_deref(),
                     )?)?,
-                    echo: !quiet,
+                    // JSON Lines owns stdout; the command's output goes to stderr instead.
+                    echo: match (quiet, format) {
+                        (true, _) => run::Echo::Off,
+                        (false, Format::Jsonl) => run::Echo::Stderr,
+                        (false, Format::Text) => run::Echo::Terminal,
+                    },
                     store_streams: !common.no_streams,
                     git: !common.no_git,
                 };
@@ -327,7 +343,8 @@ fn run_cmd(a: ExecArgs, cwd: &Path, config_path: Option<&Path>) -> Result<u8> {
         git: !a.common.no_git,
         python: a.python,
         rerun_of: None,
-        echo: true,
+        echo: run::Echo::Terminal,
+        exclude: Vec::new(),
     };
     let outcome = run::execute(&spec)?;
     let mut err = io::stderr().lock();
@@ -471,7 +488,7 @@ fn dupes_cmd(a: DupesArgs) -> Result<u8> {
                     g.paths.len(),
                     g.bytes,
                     g.reclaimable_bytes,
-                    &g.sha256[..12]
+                    prov::hash::short(&g.sha256)
                 )?;
                 for p in &g.paths {
                     writeln!(out, "  {p}")?;

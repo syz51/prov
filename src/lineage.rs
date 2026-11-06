@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::hash::short;
 use crate::run::{RunRecord, Snapshot, read_record};
 
 /// Lexically normalises a path (`.` and `..` resolved without touching the file system).
@@ -100,10 +101,6 @@ fn display(p: &Path, base: &Path) -> String {
         .unwrap_or_else(|_| p.display().to_string())
 }
 
-fn short(h: &str) -> &str {
-    &h[..12.min(h.len())]
-}
-
 fn exit_label(r: &RunRecord) -> String {
     match (r.exit.code, r.exit.signal) {
         (Some(c), _) => format!("exit {c}"),
@@ -193,9 +190,6 @@ pub fn text(l: &Lineage, base: &Path) -> String {
                 .unwrap_or_else(|| "-".into());
             let _ = writeln!(s, "    {}  produced by {p}; consumed by {c}", short(h));
         }
-    }
-    for sk in &l.skipped {
-        let _ = writeln!(s, "skipped {sk}");
     }
     s
 }

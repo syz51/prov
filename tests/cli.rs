@@ -988,6 +988,15 @@ fn run_records_git_state_without_the_state_dir() {
     assert_eq!(g["dirty_sha256"].as_str().unwrap().len(), 64);
 }
 
+fn prov_with(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_prov"));
+    cmd.args(args).current_dir(cwd);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run prov")
+}
+
 fn has(f: &[Value], rule: &str, subject: &str) -> bool {
     f.iter()
         .any(|x| x["rule"] == rule && x["subject"] == subject)
@@ -995,6 +1004,220 @@ fn has(f: &[Value], rule: &str, subject: &str) -> bool {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Records `sh -c <script>` with the given declared paths in state dir `s`.
+fn record_sh(d: &Path, env: &[(&str, &str)], paths: &[&str], script: &str) -> String {
+    let mut args = vec!["run"];
+    args.extend_from_slice(paths);
+    args.extend_from_slice(&["--state-dir", "s", "--no-git", "--", "sh", "-c", script]);
+    let out = prov_with(d, env, &args);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    record(&d.join("s")).0.to_str().unwrap().to_owned()
+}
+
+fn rerun(d: &Path, env: &[(&str, &str)], rec: &str, extra: &[&str]) -> (Output, Vec<Value>) {
+    let mut args = vec!["run", "rerun", rec, "--state-dir", "s", "--quiet"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--format", "jsonl"]);
+    let out = prov_with(d, env, &args);
+    let f = findings(&out);
+    (out, f)
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_in_place_clears_outputs_before_running() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a.txt"), b"alpha\n");
+    write(
+        &d.join("mk.sh"),
+        b"[ -n \"$SKIP\" ] || { cp a.txt out.txt; mkdir -p dir; cp a.txt dir/x; }\n",
+    );
+    let rec = record_sh(
+        d,
+        &[],
+        &["--in", "a.txt", "--out", "out.txt", "--out", "dir"],
+        "sh mk.sh",
+    );
+    // A stale file in the output directory must not survive into the comparison.
+    write(&d.join("dir/stale"), b"old\n");
+    let (out, f) = rerun(d, &[("SKIP", "1")], &rec, &["--in-place"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(has(&f, "output-missing", "out.txt"), "{f:?}");
+    assert!(has(&f, "output-missing", "dir"), "{f:?}");
+    assert!(!f.iter().any(|x| x["rule"] == "output-identical"));
+    assert!(!d.join("out.txt").exists() && !d.join("dir").exists());
+    // The originals were moved to the baseline, not lost.
+    let work = PathBuf::from(summary(&f, "rerun-summary")["record"].as_str().unwrap());
+    assert!(work.exists());
+
+    // A rerun that writes them again compares clean, and the stale file is gone.
+    let (out, f) = rerun(d, &[], &rec, &["--in-place"]);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert!(has(&f, "output-identical", "out.txt"));
+    assert!(has(&f, "output-identical", "dir/x"));
+    assert!(!d.join("dir/stale").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_reports_outputs_it_did_not_rewrite() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("dir/config.txt"), b"cfg\n");
+    // The output directory holds a declared input, so it cannot be cleared.
+    let rec = record_sh(
+        d,
+        &[],
+        &["--in", "dir/config.txt", "--out", "dir"],
+        "[ -n \"$SKIP\" ] || echo result > dir/result.txt",
+    );
+    let (out, f) = rerun(d, &[("SKIP", "1")], &rec, &["--in-place"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(has(&f, "output-not-cleared", "dir"), "{f:?}");
+    assert!(has(&f, "output-not-rewritten", "dir"), "{f:?}");
+    assert!(!f.iter().any(|x| x["rule"] == "output-identical"), "{f:?}");
+    assert_eq!(fs::read(d.join("dir/config.txt")).unwrap(), b"cfg\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_rerun_of_the_whole_directory() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a.txt"), b"alpha\n");
+    // `--in .` holds the state dir and therefore the scratch dir: it must be left out of the
+    // snapshot (no input-modified) and of the copy (no endless recursion).
+    let rec = record_sh(
+        d,
+        &[],
+        &["--in", ".", "--out", "out.txt"],
+        "[ -n \"$SKIP\" ] || cp a.txt out.txt",
+    );
+    let (_, v) = record(&d.join("s"));
+    assert!(v["findings"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(
+        v["inputs"][0]["state"]["excluded"],
+        serde_json::json!(["out.txt", "s"])
+    );
+    let (out, f) = rerun(d, &[], &rec, &[]);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert!(has(&f, "output-identical", "out.txt"));
+    // out.txt came along in the copy of `.`; it is cleared, so a run that skips it fails.
+    let (out, f) = rerun(d, &[("SKIP", "1")], &rec, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(has(&f, "output-missing", "out.txt"), "{f:?}");
+    // Verify re-applies the exclusion, so later runs do not show as drift.
+    let v = prov(d, &["run", "verify", &rec, "--format", "jsonl"]);
+    let vf = findings(&v);
+    assert!(!vf.iter().any(|x| x["rule"] == "input-drift"), "{vf:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_in_current_directory_excludes_the_state_dir() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a.txt"), b"alpha\n");
+    let out = prov(d, &["run", "--in", ".", "--no-git", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (_, v) = record(&d.join(".research"));
+    assert_eq!(v["inputs"][0]["modified_by_run"], false);
+    assert_eq!(
+        v["inputs"][0]["state"]["excluded"],
+        serde_json::json!([".research"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_compares_stdout_and_stderr() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let rec = record_sh(
+        d,
+        &[("V", "0.91")],
+        &["--env", "V"],
+        "echo accuracy=$V; echo note=$V >&2",
+    );
+    let (out, f) = rerun(d, &[("V", "0.91")], &rec, &["--compare"]);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert_eq!(
+        f.iter().filter(|x| x["rule"] == "stream-identical").count(),
+        2
+    );
+    let (out, f) = rerun(d, &[("V", "0.42")], &rec, &["--compare"]);
+    assert_eq!(out.status.code(), Some(1));
+    let so = f.iter().find(|x| x["rule"] == "stdout-differs").unwrap();
+    assert_eq!(so["severity"], "error");
+    let se = f.iter().find(|x| x["rule"] == "stderr-differs").unwrap();
+    assert_eq!(se["severity"], "warn");
+    assert_eq!(summary(&f, "rerun-summary")["streams_differ"], 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_reports_the_rerun_records_own_findings() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("data.txt"), b"1\n");
+    let rec = record_sh(
+        d,
+        &[],
+        &["--in", "data.txt"],
+        "[ -z \"$X\" ] || echo 2 >> data.txt",
+    );
+    let (out, f) = rerun(d, &[("X", "1")], &rec, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let m = f.iter().find(|x| x["rule"] == "input-modified").unwrap();
+    assert_eq!(m["severity"], "error");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_redacts_secrets_in_argv() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "echo",
+            "https://user:pw-0451@example.invalid/x",
+            "--token=tok-0451",
+            "--password",
+            "pass-0451",
+            "API_KEY=key-0451",
+            "--keyframes",
+            "12",
+            "plain",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (path, v) = record(&d.join("s"));
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("0451"), "{text}");
+    assert_eq!(v["argv"][1], "https://REDACTED@example.invalid/x");
+    assert_eq!(v["argv"][2], "--token=REDACTED");
+    assert_eq!(v["argv"][4], "REDACTED");
+    assert_eq!(v["argv"][5], "API_KEY=REDACTED");
+    assert_eq!(
+        v["argv"][7], "12",
+        "options match secret words whole, so --keyframes keeps its value"
+    );
+    assert_eq!(v["argv_redacted"], serde_json::json!([1, 2, 4, 5]));
+    let out = prov(
+        d,
+        &["run", "rerun", path.to_str().unwrap(), "--state-dir", "s"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("cannot be rerun"));
 }
 
 #[test]
@@ -1222,6 +1445,85 @@ fn build_include_and_exclude_directories() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rerun_with_jsonl_keeps_stdout_for_findings() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let rec = record_sh(d, &[], &[], "echo hello-from-command");
+    let out = prov(
+        d,
+        &[
+            "run",
+            "rerun",
+            &rec,
+            "--state-dir",
+            "s",
+            "--format",
+            "jsonl",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let f = findings(&out); // panics on any non-JSON line
+    assert!(!f.is_empty());
+    assert!(stderr(&out).contains("hello-from-command"));
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_record_hashes_exit_2() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a"), b"a");
+    let rec = record_sh(d, &[], &["--in", "a"], "true");
+    let mut v: Value = serde_json::from_slice(&fs::read(&rec).unwrap()).unwrap();
+    v["inputs"][0]["state"]["sha256"] = "ééé".into();
+    fs::write(&rec, serde_json::to_vec(&v).unwrap()).unwrap();
+    for args in [
+        vec!["run", "verify", &rec],
+        vec!["run", "rerun", &rec, "--state-dir", "s"],
+    ] {
+        let out = prov(d, &args);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stderr(&out).contains("not 64 lowercase hex digits"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_scratch_dir_name_is_sanitized() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let rec = record_sh(d, &[], &[], "true");
+    let mut v: Value = serde_json::from_slice(&fs::read(&rec).unwrap()).unwrap();
+    v["id"] = "../../../../escape".into();
+    fs::write(&rec, serde_json::to_vec(&v).unwrap()).unwrap();
+    let (out, f) = rerun(d, &[], &rec, &[]);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    let cwd = PathBuf::from(summary(&f, "rerun-summary")["cwd"].as_str().unwrap());
+    let reruns = d.join("s/reruns").canonicalize().unwrap();
+    assert_eq!(cwd.parent().unwrap(), reruns);
+    assert!(!d.join("escape").exists() && !t.path().parent().unwrap().join("escape").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_compares_each_directory_file_against_its_own_baseline() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let script = "mkdir -p out; printf '{\"v\": 1.%s}' \"$N\" > out/a.json; echo fixed > out/b.txt";
+    let rec = record_sh(d, &[("N", "0001")], &["--out", "out", "--env", "N"], script);
+    // One file of the original output drifts; the other must still be compared by value.
+    write(&d.join("out/b.txt"), b"edited\n");
+    let (out, f) = rerun(d, &[("N", "0002")], &rec, &["--compare", "--rtol", "1e-3"]);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert!(
+        has(&f, "output-equal-within-tolerance", "out/a.json"),
+        "{f:?}"
+    );
+    assert!(has(&f, "output-identical", "out/b.txt"), "{f:?}");
+}
+
 #[test]
 fn diff_treats_unrecorded_paths_as_unchecked() {
     let t = tempfile::tempdir().unwrap();
@@ -1250,4 +1552,122 @@ fn diff_treats_unrecorded_paths_as_unchecked() {
     assert_eq!(out.status.code(), Some(0), "{f:?}");
     assert!(has(&f, "diff-unchecked", "a.txt"), "{f:?}");
     assert!(!has(&f, "diff-removed", "a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupts_reach_the_command_and_the_record_is_still_written() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    // The command interrupts prov itself, as Ctrl-C would; prov must survive and record.
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "kill -INT $PPID; sleep 0.2; echo after",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (_, v) = record(&d.join("s"));
+    assert_eq!(v["exit"]["code"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_run_leaves_an_incomplete_marker() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "kill -KILL $PPID; sleep 0.2",
+        ],
+    );
+    assert_eq!(out.status.code(), None);
+    let (path, v) = record(&d.join("s"));
+    assert_eq!(v["status"], "incomplete");
+    let out = prov(d, &["run", "verify", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("incomplete record"));
+    // Lineage skips it, on stderr only.
+    let out = prov(d, &["lineage", "s/runs"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("skipped"));
+    assert!(stderr(&out).contains("incomplete record"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_compares_the_exit_signal() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let out = prov_with(
+        d,
+        &[("SIG", "TERM")],
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "kill -$SIG $$",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(128 + 15));
+    let rec = record(&d.join("s")).0.to_str().unwrap().to_owned();
+    let (_, f) = rerun(d, &[("SIG", "TERM")], &rec, &[]);
+    assert!(
+        !f.iter().any(|x| x["rule"] == "exit-status-differs"),
+        "{f:?}"
+    );
+    let (out, f) = rerun(d, &[("SIG", "HUP")], &rec, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let e = f
+        .iter()
+        .find(|x| x["rule"] == "exit-status-differs")
+        .unwrap();
+    assert_eq!(e["message"], "recorded exit signal 15, rerun exit signal 1");
+}
+
+#[cfg(unix)]
+#[test]
+fn failure_after_the_command_started_exits_125() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    // The command makes the runs directory read-only, so the record cannot be written.
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--no-streams",
+            "--",
+            "chmod",
+            "500",
+            "s/runs",
+        ],
+    );
+    fs::set_permissions(d.join("s/runs"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("the command ran"), "{err}");
+    assert!(err.contains("\"schema\": \"rf.run/1\""), "{err}");
 }

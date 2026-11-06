@@ -480,6 +480,7 @@ dependencies = [
  "csv",
  "globset",
  "jiff",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

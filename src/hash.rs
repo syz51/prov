@@ -56,6 +56,16 @@ pub fn normalize_sha256(value: &str) -> Option<String> {
     (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
 }
 
+/// The first 12 characters of a hash, for messages; never panics on malformed input.
+pub fn short(h: &str) -> &str {
+    h.char_indices().nth(12).map_or(h, |(i, _)| &h[..i])
+}
+
+/// Whether `s` is a SHA-256 as prov writes it: 64 lowercase hex digits.
+pub fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

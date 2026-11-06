@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::compare::{self, Kind, Tolerance};
 use crate::finding::{Finding, Report, Severity};
-use crate::hash::{hash_file, hex, sha256_bytes};
+use crate::hash::{hash_file, hex, is_sha256, sha256_bytes, short};
 use crate::manifest::check_schema;
 use crate::walk::{EntryKind, Filter, walk};
 
@@ -47,17 +47,25 @@ pub const DEFAULT_ENV: &[&str] = &[
     "TRANSFORMERS_OFFLINE",
 ];
 
-/// A variable whose upper-cased name contains one of these is never recorded.
+/// A name whose upper-cased form contains one of these is treated as a secret
+/// (`PASS` covers `PASSWORD`, `PASSWD` and `PASSPHRASE`).
 pub const SECRET_MARKERS: &[&str] = &[
     "KEY",
     "TOKEN",
     "SECRET",
-    "PASSWORD",
-    "PASSWD",
+    "PASS",
     "AUTH",
     "COOKIE",
     "CREDENTIAL",
+    "PRIVATE",
 ];
+
+/// Markers too short to match inside words: they count only as a whole `_`/`-`-separated
+/// part of the name, so `MYSQL_PWD` and `GITHUB_PAT` are secrets but `PATH` is not.
+pub const SECRET_WORDS: &[&str] = &["PAT", "PWD"];
+
+/// Stored in place of a value that looked like a secret.
+pub const REDACTED: &str = "REDACTED";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -95,6 +103,9 @@ pub enum Snapshot {
         bytes: u64,
         sha256: String,
         files: Vec<TreeEntry>,
+        /// Paths relative to the directory that were left out (prov's state directory).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded: Vec<String>,
     },
     Missing,
     Unreadable {
@@ -112,18 +123,80 @@ impl Snapshot {
 
     fn describe(&self) -> String {
         match self {
-            Snapshot::File { bytes, sha256 } => format!("file {} ({bytes} bytes)", &sha256[..12]),
+            Snapshot::File { bytes, sha256 } => format!("file {} ({bytes} bytes)", short(sha256)),
             Snapshot::Dir { files, sha256, .. } => {
-                format!("directory {} ({} entries)", &sha256[..12], files.len())
+                format!("directory {} ({} entries)", short(sha256), files.len())
             }
             Snapshot::Missing => "missing".to_owned(),
             Snapshot::Unreadable { error } => format!("unreadable ({error})"),
         }
     }
+
+    /// The paths a directory snapshot left out, to apply again when it is re-taken.
+    pub fn excluded(&self) -> &[String] {
+        match self {
+            Snapshot::Dir { excluded, .. } => excluded,
+            _ => &[],
+        }
+    }
+
+    fn sha256s(&self) -> Vec<&str> {
+        match self {
+            Snapshot::File { sha256, .. } => vec![sha256],
+            Snapshot::Dir { sha256, files, .. } => std::iter::once(sha256.as_str())
+                .chain(files.iter().filter_map(|f| match f {
+                    TreeEntry::File { sha256, .. } => Some(sha256.as_str()),
+                    TreeEntry::Symlink { .. } => None,
+                }))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Resolves `.` and `..` without touching the file system.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn canonical_or_lexical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| lexical(p))
+}
+
+/// The members of `skip` that lie strictly inside the directory `dir`, relative to it.
+pub fn exclusions(dir: &Path, skip: &[PathBuf]) -> Vec<String> {
+    let Ok(dir) = dir.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = skip
+        .iter()
+        .filter_map(|s| {
+            let rel = canonical_or_lexical(s)
+                .strip_prefix(&dir)
+                .ok()?
+                .to_path_buf();
+            let rel = rel.to_str()?.replace('\\', "/");
+            (!rel.is_empty()).then_some(rel)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Snapshots a path, following a symlink at the path itself but not inside directories.
-pub fn snapshot(path: &Path) -> Snapshot {
+/// In a directory, the relative paths in `excluded` are left out.
+pub fn snapshot(path: &Path, excluded: &[String]) -> Snapshot {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Snapshot::Missing,
@@ -146,7 +219,19 @@ pub fn snapshot(path: &Path) -> Snapshot {
             error: "not a regular file or directory".to_owned(),
         };
     }
-    let walked = match walk(path, &Filter::default(), false) {
+    let patterns: Vec<String> = excluded
+        .iter()
+        .map(|r| format!("/{}", globset::escape(r)))
+        .collect();
+    let filter = match Filter::new(&[], &patterns, 0) {
+        Ok(f) => f,
+        Err(e) => {
+            return Snapshot::Unreadable {
+                error: format!("{e:#}"),
+            };
+        }
+    };
+    let walked = match walk(path, &filter, false) {
         Ok(w) => w,
         Err(e) => {
             return Snapshot::Unreadable {
@@ -200,6 +285,7 @@ pub fn snapshot(path: &Path) -> Snapshot {
         bytes,
         sha256: hex(&h.finalize()),
         files,
+        excluded: excluded.to_vec(),
     }
 }
 
@@ -253,7 +339,11 @@ pub struct RunRecord {
     pub name: String,
     pub tool: String,
     pub tool_version: String,
+    /// The command as run, with values that looked like secrets replaced by `REDACTED`.
     pub argv: Vec<String>,
+    /// Indices into `argv` of the arguments that were redacted.
+    #[serde(default)]
+    pub argv_redacted: Vec<usize>,
     pub cwd: String,
     pub started_at: String,
     pub ended_at: String,
@@ -279,6 +369,9 @@ pub struct RunRecord {
 pub fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     SECRET_MARKERS.iter().any(|m| upper.contains(m))
+        || upper
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| SECRET_WORDS.contains(&w))
 }
 
 /// True for values such as `https://user:pass@host/` that embed credentials in a URL.
@@ -287,6 +380,95 @@ fn has_url_credentials(value: &str) -> bool {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         authority.contains('@')
     })
+}
+
+/// Replaces the user-info part of every URL in `value` with `REDACTED`.
+fn redact_url_credentials(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.find("://") {
+        out.push_str(&rest[..i + 3]);
+        rest = &rest[i + 3..];
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest[..end].rfind('@') {
+            out.push_str(REDACTED);
+            rest = &rest[at..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Words that make a command-line option a secret (`--api-key`, `--password`). Options
+/// match by whole word, unlike environment names, so `--keyframes`, `--author` and
+/// `--passes` keep their values.
+const SECRET_OPTION_WORDS: &[&str] = &[
+    "KEY",
+    "APIKEY",
+    "TOKEN",
+    "SECRET",
+    "PASS",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "PWD",
+    "PAT",
+    "AUTH",
+    "AUTHORIZATION",
+    "COOKIE",
+    "CREDENTIAL",
+    "CREDENTIALS",
+];
+
+/// Whether `name` (an option such as `--api-token`, or a `NAME` in `NAME=value`) names a
+/// secret.
+fn secret_option(name: &str) -> bool {
+    let bare = name.trim_start_matches('-');
+    if bare.is_empty() {
+        return false;
+    }
+    if name.starts_with('-') {
+        let upper = bare.to_ascii_uppercase();
+        return upper
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| SECRET_OPTION_WORDS.contains(&w));
+    }
+    let variable = bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !bare.starts_with(|c: char| c.is_ascii_digit());
+    variable && is_secret_name(bare)
+}
+
+/// Redacts URL credentials, `--secret=value`, `--secret value` and `SECRET=value`
+/// arguments. Returns the redacted argv and the indices that changed.
+pub fn redact_argv(argv: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut out: Vec<String> = argv.to_vec();
+    let mut changed = BTreeSet::new();
+    for i in 0..out.len() {
+        if has_url_credentials(&out[i]) {
+            out[i] = redact_url_credentials(&out[i]);
+            changed.insert(i);
+        }
+        if i == 0 {
+            continue;
+        }
+        match argv[i].split_once('=') {
+            Some((name, value)) if !value.is_empty() && secret_option(name) => {
+                out[i] = format!("{name}={REDACTED}");
+                changed.insert(i);
+            }
+            Some(_) => {}
+            None if argv[i].starts_with('-') && secret_option(&argv[i]) => {
+                if let Some(next) = argv.get(i + 1)
+                    && !next.starts_with('-')
+                {
+                    out[i + 1] = REDACTED.to_owned();
+                    changed.insert(i + 1);
+                }
+            }
+            None => {}
+        }
+    }
+    (out, changed.into_iter().collect())
 }
 
 fn allowed(name: &str, allow: &[String]) -> bool {
@@ -539,7 +721,82 @@ pub struct RunSpec {
     pub git: bool,
     pub python: bool,
     pub rerun_of: Option<String>,
-    pub echo: bool,
+    pub echo: Echo,
+    /// Paths left out of directory snapshots besides the state directory.
+    pub exclude: Vec<PathBuf>,
+}
+
+/// Where the command's output is passed through to while it is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Echo {
+    Off,
+    /// stdout to stdout, stderr to stderr.
+    Terminal,
+    /// Both streams to stderr, keeping prov's stdout for its own report.
+    Stderr,
+}
+
+/// The command started, but prov failed before its record was complete. `prov` exits 125
+/// for this, so it cannot be mistaken for the command's own exit status.
+#[derive(Debug)]
+pub struct AfterStart {
+    /// The record as far as it was assembled, when it got that far.
+    pub record: Option<String>,
+}
+
+impl std::fmt::Display for AfterStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the command ran, but prov could not complete its run record")
+    }
+}
+
+/// Contents of `<id>.json` while the command runs; replaced by the record when it finishes.
+fn placeholder(id: &str) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "schema": SCHEMA,
+            "id": id,
+            "status": "incomplete",
+            "note": "prov reserved this record when the command started and has not completed it; the run was interrupted or prov failed",
+        })
+    )
+}
+
+/// While alive, prov ignores the terminal's interrupt and quit signals, so Ctrl-C stops the
+/// command (which shares the terminal's process group) while prov still writes its record.
+struct IgnoreInterrupts {
+    #[cfg(unix)]
+    previous: [(libc::c_int, libc::sighandler_t); 2],
+}
+
+impl IgnoreInterrupts {
+    #[cfg(unix)]
+    fn new() -> Self {
+        let previous = [libc::SIGINT, libc::SIGQUIT].map(|sig| {
+            // SAFETY: installing SIG_IGN touches no Rust state; the previous disposition is
+            // restored in Drop.
+            (sig, unsafe { libc::signal(sig, libc::SIG_IGN) })
+        });
+        IgnoreInterrupts { previous }
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        IgnoreInterrupts {}
+    }
+}
+
+impl Drop for IgnoreInterrupts {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for (sig, handler) in self.previous {
+            if handler != libc::SIG_ERR {
+                // SAFETY: restores the disposition returned by `signal` in `new`.
+                unsafe { libc::signal(sig, handler) };
+            }
+        }
+    }
 }
 
 pub struct RunOutcome {
@@ -572,9 +829,20 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
         bail!("no command given; put it after `--`");
     };
     let resolve = |p: &str| spec.cwd.join(p);
+    let mut skip = vec![spec.state_dir.clone()];
+    skip.extend(spec.exclude.iter().cloned());
+    // A directory input leaves out declared outputs inside it: the run is meant to write them.
+    let mut input_skip = skip.clone();
+    input_skip.extend(spec.outputs.iter().map(|p| resolve(p)));
+    let take_with = |p: &str, skip: &[PathBuf]| {
+        let abs = resolve(p);
+        snapshot(&abs, &exclusions(&abs, skip))
+    };
+    let take = |p: &str| take_with(p, &skip);
+    let take_input = |p: &str| take_with(p, &input_skip);
     let mut inputs = Vec::new();
     for p in &spec.inputs {
-        let snap = snapshot(&resolve(p));
+        let snap = take_input(p);
         match &snap {
             Snapshot::Missing => bail!("input {p} not found (relative to {})", spec.cwd.display()),
             Snapshot::Unreadable { error } => bail!("input {p} cannot be read: {error}"),
@@ -587,8 +855,7 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
             after: None,
         });
     }
-    let outputs_before: Vec<Snapshot> =
-        spec.outputs.iter().map(|p| snapshot(&resolve(p))).collect();
+    let outputs_before: Vec<Snapshot> = spec.outputs.iter().map(|p| take(p)).collect();
 
     let mut allow: Vec<String> = DEFAULT_ENV.iter().map(|s| (*s).to_owned()).collect();
     allow.extend(spec.extra_env.iter().cloned());
@@ -640,7 +907,11 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     let record_path = loop {
         let p = runs.join(format!("{id}.json"));
         match OpenOptions::new().write(true).create_new(true).open(&p) {
-            Ok(_) => break p,
+            Ok(mut f) => {
+                f.write_all(placeholder(&id).as_bytes())
+                    .with_context(|| format!("cannot write {}", p.display()))?;
+                break p;
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 n += 1;
                 id = format!("{stamp}-{name}-{n}");
@@ -648,28 +919,32 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
             Err(e) => return Err(e).with_context(|| format!("cannot create {}", p.display())),
         }
     };
-    let stream_file = |ext: &str| -> Result<(Option<File>, Option<String>)> {
-        if !spec.store_streams {
-            return Ok((None, None));
-        }
-        let rel = format!("{id}.{ext}");
-        let f = File::create(runs.join(&rel))
-            .with_context(|| format!("cannot create {}", runs.join(&rel).display()))?;
-        Ok((Some(f), Some(rel)))
+    let streams = |ext: &str| spec.store_streams.then(|| format!("{id}.{ext}"));
+    let (out_rel, err_rel) = (streams("stdout"), streams("stderr"));
+    // Until the command starts, a failure leaves nothing behind.
+    let start = || -> Result<(std::process::Child, Option<File>, Option<File>)> {
+        let open = |rel: &Option<String>| -> Result<Option<File>> {
+            rel.as_ref()
+                .map(|r| {
+                    File::create(runs.join(r))
+                        .with_context(|| format!("cannot create {}", runs.join(r).display()))
+                })
+                .transpose()
+        };
+        let (out_file, err_file) = (open(&out_rel)?, open(&err_rel)?);
+        let child = Command::new(argv0)
+            .args(&spec.argv[1..])
+            .current_dir(&spec.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("cannot start {argv0}"))?;
+        Ok((child, out_file, err_file))
     };
-    let (out_file, out_rel) = stream_file("stdout")?;
-    let (err_file, err_rel) = stream_file("stderr")?;
-
     let clock = Instant::now();
-    let child = Command::new(argv0)
-        .args(&spec.argv[1..])
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
+    let (mut child, out_file, err_file) = match start() {
+        Ok(started) => started,
         Err(e) => {
             for p in [Some(format!("{id}.json")), out_rel, err_rel]
                 .into_iter()
@@ -677,35 +952,38 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
             {
                 let _ = fs::remove_file(runs.join(p));
             }
-            bail!("cannot start {argv0}: {e}");
+            return Err(e);
         }
     };
+    let interrupts = IgnoreInterrupts::new();
+    let after_start = |e: anyhow::Error| e.context(AfterStart { record: None });
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
-    let echo = spec.echo;
-    let t_out = std::thread::spawn(move || {
-        tee(
-            stdout,
-            echo.then(|| Box::new(io::stdout()) as Box<dyn Write + Send>),
-            out_file,
-        )
-    });
-    let t_err = std::thread::spawn(move || {
-        tee(
-            stderr,
-            echo.then(|| Box::new(io::stderr()) as Box<dyn Write + Send>),
-            err_file,
-        )
-    });
-    let status = child.wait().context("waiting for the command")?;
+    let sink = |to_stdout: bool| -> Option<Box<dyn Write + Send>> {
+        match (spec.echo, to_stdout) {
+            (Echo::Off, _) => None,
+            (Echo::Terminal, true) => Some(Box::new(io::stdout())),
+            _ => Some(Box::new(io::stderr())),
+        }
+    };
+    let (out_sink, err_sink) = (sink(true), sink(false));
+    let t_out = std::thread::spawn(move || tee(stdout, out_sink, out_file));
+    let t_err = std::thread::spawn(move || tee(stderr, err_sink, err_file));
+    let status = child
+        .wait()
+        .context("waiting for the command")
+        .map_err(after_start)?;
     let out_tee = t_out
         .join()
         .expect("stdout thread panicked")
-        .context("reading stdout")?;
+        .context("reading stdout")
+        .map_err(after_start)?;
     let err_tee = t_err
         .join()
         .expect("stderr thread panicked")
-        .context("reading stderr")?;
+        .context("reading stderr")
+        .map_err(after_start)?;
+    drop(interrupts);
     let duration_ms = clock.elapsed().as_millis() as u64;
     let ended = jiff::Timestamp::now();
 
@@ -748,7 +1026,7 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
         }
     }
     for input in &mut inputs {
-        let now = snapshot(&resolve(&input.path));
+        let now = take_input(&input.path);
         if now != input.state {
             findings.push(
                 Finding::new(
@@ -769,7 +1047,7 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     }
     let mut outputs = Vec::new();
     for (p, before) in spec.outputs.iter().zip(outputs_before) {
-        let state = snapshot(&resolve(p));
+        let state = take(p);
         match &state {
             Snapshot::Missing => findings.push(Finding::new(
                 "output-missing",
@@ -798,13 +1076,29 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
         });
     }
 
+    let (argv, argv_redacted) = redact_argv(&spec.argv);
+    if !argv_redacted.is_empty() {
+        findings.push(
+            Finding::new(
+                "argv-redacted",
+                Severity::Warn,
+                &id,
+                format!(
+                    "{} command-line arguments looked like secrets and were recorded as {REDACTED}; the record cannot be rerun",
+                    argv_redacted.len()
+                ),
+            )
+            .with_data(json!({"indices": argv_redacted})),
+        );
+    }
     let record = RunRecord {
         schema: SCHEMA.to_owned(),
         id: id.clone(),
         name,
         tool: "prov".to_owned(),
         tool_version: crate::VERSION.to_owned(),
-        argv: spec.argv.clone(),
+        argv,
+        argv_redacted,
         cwd: spec.cwd.to_string_lossy().into_owned(),
         started_at: started.to_string(),
         ended_at: ended.to_string(),
@@ -836,11 +1130,20 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
         rerun_of: spec.rerun_of.clone(),
     };
     let partial = runs.join(format!("{id}.json.partial"));
-    let mut data = serde_json::to_vec_pretty(&record)?;
+    let mut data = serde_json::to_vec_pretty(&record).map_err(|e| after_start(e.into()))?;
     data.push(b'\n');
-    fs::write(&partial, &data).with_context(|| format!("cannot write {}", partial.display()))?;
-    fs::rename(&partial, &record_path)
-        .with_context(|| format!("cannot write {}", record_path.display()))?;
+    let written = fs::write(&partial, &data)
+        .with_context(|| format!("cannot write {}", partial.display()))
+        .and_then(|()| {
+            fs::rename(&partial, &record_path)
+                .with_context(|| format!("cannot write {}", record_path.display()))
+        });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(e.context(AfterStart {
+            record: Some(String::from_utf8_lossy(&data).into_owned()),
+        }));
+    }
     Ok(RunOutcome {
         record,
         path: record_path,
@@ -848,12 +1151,43 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
 }
 
 pub fn read_record(path: &Path) -> Result<RunRecord> {
-    let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let v: Value = serde_json::from_slice(&data)
-        .with_context(|| format!("{}: invalid JSON", path.display()))?;
-    check_schema(&v, "rf.run", 1, &path.display().to_string())?;
-    serde_json::from_value(v)
-        .with_context(|| format!("{}: invalid rf.run/1 record", path.display()))
+    let label = path.display();
+    let data = fs::read(path).with_context(|| format!("cannot read {label}"))?;
+    let v: Value =
+        serde_json::from_slice(&data).with_context(|| format!("{label}: invalid JSON"))?;
+    check_schema(&v, "rf.run", 1, &label.to_string())?;
+    if v.get("status").and_then(Value::as_str) == Some("incomplete") {
+        bail!(
+            "{label}: incomplete record; the run was interrupted or prov failed before writing it"
+        );
+    }
+    let rec: RunRecord =
+        serde_json::from_value(v).with_context(|| format!("{label}: invalid rf.run/1 record"))?;
+    let mut hashes: Vec<(&str, &str)> = vec![
+        ("stdout", rec.stdout.sha256.as_str()),
+        ("stderr", rec.stderr.sha256.as_str()),
+    ];
+    hashes.extend(rec.program.iter().map(|p| ("program", p.sha256.as_str())));
+    for i in &rec.inputs {
+        let after = i.after.iter().flat_map(Snapshot::sha256s);
+        hashes.extend(
+            i.state
+                .sha256s()
+                .into_iter()
+                .chain(after)
+                .map(|h| (i.path.as_str(), h)),
+        );
+    }
+    for o in &rec.outputs {
+        let both = o.before.sha256s().into_iter().chain(o.state.sha256s());
+        hashes.extend(both.map(|h| (o.path.as_str(), h)));
+    }
+    if let Some((what, h)) = hashes.into_iter().find(|(_, h)| !is_sha256(h)) {
+        bail!(
+            "{label}: invalid rf.run/1 record: {what} has sha256 {h:?}, not 64 lowercase hex digits"
+        );
+    }
+    Ok(rec)
 }
 
 fn tree_changes(a: &[TreeEntry], b: &[TreeEntry]) -> Value {
@@ -902,7 +1236,7 @@ pub fn verify_record(path: &Path, root: Option<&Path>) -> Result<Report> {
     let (mut ok, mut bad, mut skipped) = (0u64, 0u64, 0u64);
     for i in &rec.inputs {
         let expected = i.after.as_ref().unwrap_or(&i.state);
-        let now = snapshot(&base.join(&i.path));
+        let now = snapshot(&base.join(&i.path), expected.excluded());
         if &now == expected {
             ok += 1;
         } else {
@@ -929,7 +1263,7 @@ pub fn verify_record(path: &Path, root: Option<&Path>) -> Result<Report> {
             ));
             continue;
         }
-        let now = snapshot(&base.join(&o.path));
+        let now = snapshot(&base.join(&o.path), o.state.excluded());
         if now == o.state {
             ok += 1;
         } else {
@@ -957,7 +1291,7 @@ pub fn verify_record(path: &Path, root: Option<&Path>) -> Result<Report> {
             Ok((n, h)) if h == s.sha256 && n == s.bytes => ok += 1,
             Ok((n, h)) => {
                 bad += 1;
-                report.push(Finding::new("stream-drift", Severity::Error, p, format!("stored {label} differs from the record: {n} bytes, sha256 {} (recorded {} bytes, {})", &h[..12], s.bytes, &s.sha256[..12.min(s.sha256.len())])));
+                report.push(Finding::new("stream-drift", Severity::Error, p, format!("stored {label} differs from the record: {n} bytes, sha256 {} (recorded {} bytes, {})", short(&h), s.bytes, short(&s.sha256))));
             }
             Err(e) => {
                 bad += 1;
@@ -1022,8 +1356,9 @@ fn contained(p: &str) -> bool {
     true
 }
 
-/// Copies a file or directory tree, recreating symlinks rather than following them.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// Copies a file or directory tree, recreating symlinks rather than following them. Paths in
+/// `skip` (canonical) are not copied, so a destination inside the source cannot recurse.
+fn copy_tree(from: &Path, to: &Path, skip: &[PathBuf]) -> Result<()> {
     let meta = fs::metadata(from).with_context(|| format!("cannot read {}", from.display()))?;
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
@@ -1033,9 +1368,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))?;
         return Ok(());
     }
-    for e in walkdir::WalkDir::new(from).follow_links(false) {
+    let from = from.canonicalize()?;
+    let walker = walkdir::WalkDir::new(&from)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !skip.iter().any(|s| e.path() == s));
+    for e in walker {
         let e = e?;
-        let rel = e.path().strip_prefix(from)?;
+        let rel = e.path().strip_prefix(&from)?;
         let dest = to.join(rel);
         let ft = e.file_type();
         if ft.is_dir() {
@@ -1057,6 +1397,17 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Removes a file, symlink or directory tree; a missing path is not an error.
+fn remove_path(p: &Path) -> Result<()> {
+    let removed = match fs::symlink_metadata(p) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+        Ok(_) => fs::remove_file(p),
+    };
+    removed.with_context(|| format!("cannot remove {}", p.display()))
+}
+
 pub struct RerunOptions {
     pub record: PathBuf,
     pub in_place: bool,
@@ -1064,14 +1415,24 @@ pub struct RerunOptions {
     pub compare: bool,
     pub tol: Tolerance,
     pub state_dir: PathBuf,
-    pub echo: bool,
+    pub echo: Echo,
     pub store_streams: bool,
     pub git: bool,
 }
 
-/// Reruns a recorded command and compares its outputs with the recorded ones.
+/// Reruns a recorded command and compares its outputs and streams with the recorded ones.
+///
+/// Outputs are cleared first (moved to `<work>/baseline/` in place; deleted from the scratch
+/// copy), so an output the rerun does not write is reported rather than compared stale.
 pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
     let rec = read_record(&opts.record)?;
+    if !rec.argv_redacted.is_empty() {
+        bail!(
+            "{}: arguments {:?} were recorded as {REDACTED} because they looked like secrets; the command cannot be rerun from the record",
+            opts.record.display(),
+            rec.argv_redacted
+        );
+    }
     let base = PathBuf::from(&rec.cwd);
     let mut report = Report::default();
     let now = jiff::Timestamp::now();
@@ -1083,13 +1444,61 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
     let work = opts.scratch.clone().unwrap_or_else(|| {
         opts.state_dir
             .join("reruns")
-            .join(format!("{}-{stamp}", rec.id))
+            .join(format!("{}-{stamp}", sanitize_name(&rec.id)))
     });
     if work.exists() && fs::read_dir(&work)?.next().is_some() {
         bail!("{} exists and is not empty", work.display());
     }
     fs::create_dir_all(&work).with_context(|| format!("cannot create {}", work.display()))?;
     let work = work.canonicalize()?;
+    let outputs_abs: Vec<PathBuf> = rec
+        .outputs
+        .iter()
+        .map(|o| canonical_or_lexical(&base.join(&o.path)))
+        .collect();
+    // Never copied, cleared or snapshotted: prov's state, the rerun's own directory, and what
+    // the recorded snapshots left out other than declared outputs (an earlier state dir).
+    let mut protect = vec![canonical_or_lexical(&opts.state_dir), work.clone()];
+    // Not copied into the scratch directory or snapshotted: the above and declared outputs.
+    let mut skip = protect.clone();
+    for (path, snap) in rec
+        .inputs
+        .iter()
+        .map(|i| (&i.path, &i.state))
+        .chain(rec.outputs.iter().map(|o| (&o.path, &o.state)))
+    {
+        for x in snap.excluded() {
+            let abs = canonical_or_lexical(&base.join(path).join(x));
+            if !outputs_abs.contains(&abs) {
+                protect.push(abs.clone());
+            }
+            skip.push(abs);
+        }
+    }
+    let inputs_abs: Vec<PathBuf> = rec
+        .inputs
+        .iter()
+        .map(|i| lexical(&base.join(&i.path)))
+        .collect();
+    // Clearing an output that is, or contains, a declared input would destroy the input.
+    let holds_input = |o: &str| {
+        let o = lexical(&base.join(o));
+        inputs_abs.iter().any(|i| i.starts_with(&o))
+    };
+    let holds_protected = |p: &Path| {
+        let p = canonical_or_lexical(p);
+        protect.iter().any(|s| s.starts_with(&p))
+    };
+    let not_cleared = |path: &str, why: &str| {
+        Finding::new(
+            "output-not-cleared",
+            Severity::Warn,
+            path,
+            format!(
+                "{why}, so it was not cleared before the rerun; if the rerun does not rewrite it, it is reported as not rewritten"
+            ),
+        )
+    };
 
     let (cwd, baselines): (PathBuf, Vec<PathBuf>) = if opts.in_place {
         let dir = work.join("baseline");
@@ -1101,8 +1510,21 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
                 .map(|n| n.to_owned())
                 .unwrap_or_else(|| "output".into());
             let dest = dir.join(i.to_string()).join(name);
-            if src.exists() {
-                copy_tree(&src, &dest)?;
+            if fs::symlink_metadata(&src).is_ok() {
+                copy_tree(&src, &dest, &protect)?;
+                if holds_input(&o.path) {
+                    report.push(not_cleared(
+                        &o.path,
+                        "output is or contains a declared input",
+                    ));
+                } else if holds_protected(&src) {
+                    report.push(not_cleared(
+                        &o.path,
+                        "output contains prov's state directory",
+                    ));
+                } else {
+                    remove_path(&src)?;
+                }
             }
             paths.push(dest);
         }
@@ -1116,7 +1538,7 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
         }
         for i in &rec.inputs {
             if contained(&i.path) {
-                copy_tree(&base.join(&i.path), &work.join(&i.path))?;
+                copy_tree(&base.join(&i.path), &work.join(&i.path), &skip)?;
             } else {
                 report.push(Finding::new(
                     "input-not-isolated",
@@ -1127,7 +1549,19 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
             }
         }
         for o in &rec.outputs {
-            if let Some(parent) = work.join(&o.path).parent() {
+            let at = work.join(&o.path);
+            // An output inside a copied input directory came along with it; clear it.
+            if fs::symlink_metadata(&at).is_ok() {
+                if holds_input(&o.path) {
+                    report.push(not_cleared(
+                        &o.path,
+                        "output is or contains a declared input",
+                    ));
+                } else {
+                    remove_path(&at)?;
+                }
+            }
+            if let Some(parent) = at.parent() {
                 fs::create_dir_all(parent)?;
             }
         }
@@ -1148,7 +1582,7 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
         } else {
             base.join(&i.path)
         };
-        let now = snapshot(&at);
+        let now = snapshot(&at, i.state.excluded());
         if now != i.state {
             let mut f = drift("input-drift", &i.path, &i.state, &now);
             f.message = format!(
@@ -1184,19 +1618,27 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
         python: rec.tools.contains_key("python"),
         rerun_of: Some(rec.id.clone()),
         echo: opts.echo,
+        exclude: skip.clone(),
     };
     let outcome = execute(&spec)?;
-    if outcome.record.exit.success != rec.exit.success || outcome.record.exit.code != rec.exit.code
-    {
-        report.push(Finding::new(
-            "exit-status-differs",
-            Severity::Error,
-            &outcome.record.id,
-            format!(
-                "recorded exit {:?}, rerun exit {:?}",
-                rec.exit.code, outcome.record.exit.code
-            ),
-        ));
+    // What the rerun's own record found (an input it modified, a stream it could not store).
+    report.extend(outcome.record.findings.iter().cloned());
+    let (was, is) = (&rec.exit, &outcome.record.exit);
+    if was.success != is.success || was.code != is.code || was.signal != is.signal {
+        let show = |e: &ExitInfo| match (e.code, e.signal) {
+            (Some(c), _) => format!("status {c}"),
+            (None, Some(s)) => format!("signal {s}"),
+            _ => "unknown".to_owned(),
+        };
+        report.push(
+            Finding::new(
+                "exit-status-differs",
+                Severity::Error,
+                &outcome.record.id,
+                format!("recorded exit {}, rerun exit {}", show(was), show(is)),
+            )
+            .with_data(json!({"recorded": was, "rerun": is})),
+        );
     }
     let (mut same, mut close, mut differ) = (0u64, 0u64, 0u64);
     for ((o, new), baseline) in rec
@@ -1205,14 +1647,25 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
         .zip(&outcome.record.outputs)
         .zip(&baselines)
     {
-        let baseline_ok = snapshot(baseline) == o.state;
+        if new.state == new.before && !matches!(new.before, Snapshot::Missing) {
+            differ += 1;
+            report.push(Finding::new(
+                "output-not-rewritten",
+                Severity::Error,
+                &o.path,
+                format!(
+                    "the rerun left this output as it was before it started ({}), so it cannot be compared",
+                    new.state.describe()
+                ),
+            ));
+            continue;
+        }
         let fs = compare_output(
             &o.path,
             &o.state,
             &new.state,
             baseline,
             &cwd.join(&new.path),
-            baseline_ok,
             opts.compare,
             opts.tol,
         );
@@ -1226,13 +1679,55 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
         }
         report.extend(fs);
     }
+    let (mut streams_same, mut streams_differ) = (0u64, 0u64);
+    for (label, was, is, severity) in [
+        (
+            "stdout",
+            &rec.stdout,
+            &outcome.record.stdout,
+            Severity::Error,
+        ),
+        (
+            "stderr",
+            &rec.stderr,
+            &outcome.record.stderr,
+            Severity::Warn,
+        ),
+    ] {
+        if was.sha256 == is.sha256 {
+            streams_same += 1;
+            report.push(Finding::new(
+                "stream-identical",
+                Severity::Info,
+                label,
+                format!("{label} is byte-identical ({} bytes)", is.bytes),
+            ));
+        } else {
+            streams_differ += 1;
+            report.push(
+                Finding::new(
+                    &format!("{label}-differs"),
+                    severity,
+                    label,
+                    format!(
+                        "{label} differs: recorded {} bytes, sha256 {}; rerun {} bytes, sha256 {}",
+                        was.bytes,
+                        short(&was.sha256),
+                        is.bytes,
+                        short(&is.sha256)
+                    ),
+                )
+                .with_data(json!({"recorded": was, "rerun": is})),
+            );
+        }
+    }
     report.push(
         Finding::new(
             "rerun-summary",
             Severity::Info,
             &outcome.record.id,
             format!(
-                "rerun of {} in {}: {same} outputs identical, {close} equal within tolerance (rtol {}, atol {}), {differ} differ; record {}",
+                "rerun of {} in {}: {same} outputs identical, {close} equal within tolerance (rtol {}, atol {}), {differ} differ or not rewritten; streams: {streams_same} identical, {streams_differ} differ; record {}",
                 rec.id,
                 cwd.display(),
                 opts.tol.rtol,
@@ -1240,7 +1735,7 @@ pub fn rerun(opts: &RerunOptions) -> Result<(Report, RunOutcome)> {
                 outcome.path.display()
             ),
         )
-        .with_data(json!({"rerun_of": rec.id, "cwd": cwd, "record": outcome.path, "identical": same, "within_tolerance": close, "differ": differ, "rtol": opts.tol.rtol, "atol": opts.tol.atol})),
+        .with_data(json!({"rerun_of": rec.id, "cwd": cwd, "record": outcome.path, "identical": same, "within_tolerance": close, "differ": differ, "streams_identical": streams_same, "streams_differ": streams_differ, "rtol": opts.tol.rtol, "atol": opts.tol.atol})),
     );
     Ok((report, outcome))
 }
@@ -1252,7 +1747,6 @@ fn compare_output(
     new: &Snapshot,
     baseline: &Path,
     produced: &Path,
-    baseline_ok: bool,
     structural: bool,
     tol: Tolerance,
 ) -> Vec<Finding> {
@@ -1287,14 +1781,7 @@ fn compare_output(
         )],
         (Snapshot::File { sha256: a, .. }, Snapshot::File { sha256: b, .. }) => {
             vec![compare_file(
-                path,
-                a,
-                b,
-                baseline,
-                produced,
-                baseline_ok,
-                structural,
-                tol,
+                path, a, b, baseline, produced, structural, tol,
             )]
         }
         (Snapshot::Dir { files: a, .. }, Snapshot::Dir { files: b, .. }) => {
@@ -1327,7 +1814,6 @@ fn compare_output(
                             y,
                             &baseline.join(k),
                             &produced.join(k),
-                            baseline_ok,
                             structural,
                             tol,
                         ));
@@ -1368,7 +1854,6 @@ fn compare_file(
     new: &str,
     baseline: &Path,
     produced: &Path,
-    baseline_ok: bool,
     structural: bool,
     tol: Tolerance,
 ) -> Finding {
@@ -1377,7 +1862,7 @@ fn compare_file(
             "output-identical",
             Severity::Info,
             subject,
-            format!("byte-identical (sha256 {})", &new[..12]),
+            format!("byte-identical (sha256 {})", short(new)),
         );
     }
     let bytes_differ = || {
@@ -1387,22 +1872,14 @@ fn compare_file(
             subject,
             format!(
                 "bytes differ: recorded sha256 {}, rerun {}",
-                &recorded[..12],
-                &new[..12]
+                short(recorded),
+                short(new)
             ),
         )
     };
     let Some(kind) = Kind::for_path(Path::new(subject)).filter(|_| structural) else {
         return bytes_differ();
     };
-    if !baseline_ok {
-        let mut f = bytes_differ();
-        f.message.push_str(&format!(
-            "; the recorded {} output no longer exists unchanged, so values were not compared",
-            kind.name()
-        ));
-        return f;
-    }
     let (a, b) = match (fs::read(baseline), fs::read(produced)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
@@ -1411,11 +1888,13 @@ fn compare_file(
             return f;
         }
     };
-    // The baseline file was matched against the record as a whole; recheck this file's bytes.
+    // Values are compared only against a baseline that still matches the record.
     if sha256_bytes(&a) != recorded {
         let mut f = bytes_differ();
-        f.message
-            .push_str("; the baseline file does not match the record, so values were not compared");
+        f.message.push_str(&format!(
+            "; the recorded {} output no longer exists unchanged, so values were not compared",
+            kind.name()
+        ));
         return f;
     }
     match compare::compare(kind, &a, &b, tol) {
@@ -1488,6 +1967,58 @@ mod tests {
                 "UV_PUBLISH_TOKEN"
             ]
         );
+    }
+
+    #[test]
+    fn secret_names_include_pass_pwd_and_pat() {
+        for n in [
+            "DB_PASS",
+            "GPG_PASSPHRASE",
+            "MYSQL_PWD",
+            "GITHUB_PAT",
+            "SSH_PRIVATE_FILE",
+        ] {
+            assert!(is_secret_name(n), "{n}");
+        }
+        for n in ["PATH", "PYTHONPATH", "LANG", "PATTERN", "SPATIAL_DIM"] {
+            assert!(!is_secret_name(n), "{n}");
+        }
+        let all: Vec<String> = vec!["*".into()];
+        let vars = [("MYSQL_PWD", "x"), ("GITHUB_PAT", "x"), ("PATH", "/bin")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let (kept, redacted) = select_env(vars, &all);
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["PATH"]);
+        assert_eq!(redacted, ["GITHUB_PAT", "MYSQL_PWD"]);
+    }
+
+    #[test]
+    fn argv_redaction() {
+        let argv: Vec<String> = [
+            "curl",
+            "https://u:p@h.invalid/a?b=https://x@y",
+            "--auth-token",
+            "t",
+            "--author",
+            "me",
+            "--passes=3",
+            "--db-password=pw",
+            "GITHUB_PAT=g",
+            "--key",
+            "--verbose",
+            "ok",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (out, idx) = redact_argv(&argv);
+        assert_eq!(out[1], "https://REDACTED@h.invalid/a?b=https://REDACTED@y");
+        assert_eq!(out[3], REDACTED);
+        assert_eq!(out[5], "me");
+        assert_eq!(out[6], "--passes=3");
+        assert_eq!(out[7], "--db-password=REDACTED");
+        assert_eq!(out[8], "GITHUB_PAT=REDACTED");
+        // A secret option followed by another option takes no value.
+        assert_eq!(out[10], "--verbose");
+        assert_eq!(idx, [1, 3, 7, 8]);
     }
 
     #[test]
