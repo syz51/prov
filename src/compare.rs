@@ -1,7 +1,11 @@
 //! Structural comparison of JSON, JSON Lines and CSV/TSV outputs with numeric tolerance.
 //!
-//! Two numbers `a` (baseline) and `b` (rerun) are equal when `|a - b| <= atol + rtol * |a|`.
-//! Strings, booleans and nulls compare exactly; NaN equals NaN.
+//! Two numbers `a` (baseline) and `b` (rerun) are equal when `|a - b| <= atol + rtol * |a|`;
+//! integers are differenced exactly, an infinity equals only itself, and NaN equals NaN.
+//! Strings, booleans and nulls compare exactly. CSV/TSV cells are text: they compare as
+//! numbers only under a nonzero tolerance and only when both are written canonically (no
+//! leading zeros or signs), so identifiers such as `00123` and `2.10` never match `123`
+//! and `2.1`.
 
 use std::path::Path;
 
@@ -20,6 +24,9 @@ impl Tolerance {
     pub fn close(&self, a: f64, b: f64) -> bool {
         if a == b || (a.is_nan() && b.is_nan()) {
             return true;
+        }
+        if a.is_infinite() || b.is_infinite() {
+            return false;
         }
         (a - b).abs() <= self.atol + self.rtol * a.abs()
     }
@@ -123,7 +130,7 @@ pub fn compare(kind: Kind, baseline: &[u8], rerun: &[u8], tol: Tolerance) -> Res
                     );
                 }
                 for (c, (x, y)) in ra.iter().zip(rb).enumerate() {
-                    if x == y || numbers_close_str(x, y, tol) {
+                    if x == y || cells_close(x, y, tol) {
                         continue;
                     }
                     let name = header
@@ -168,11 +175,59 @@ fn table(data: &[u8], delim: u8) -> Result<Vec<Vec<String>>, String> {
         .collect()
 }
 
-fn numbers_close_str(a: &str, b: &str, tol: Tolerance) -> bool {
-    match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-        (Ok(x), Ok(y)) => tol.close(x, y),
+/// A number written canonically: an optional `-`, an integer part without leading zeros, an
+/// optional fraction and an optional exponent. Returns whether it is an integer.
+fn canonical_number(s: &str) -> Option<bool> {
+    let b = s.strip_prefix('-').unwrap_or(s).as_bytes();
+    let int_len = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if int_len == 0 || (int_len > 1 && b[0] == b'0') {
+        return None;
+    }
+    let mut rest = &b[int_len..];
+    let mut integer = true;
+    if let Some(frac) = rest.strip_prefix(b".") {
+        let n = frac.iter().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 {
+            return None;
+        }
+        rest = &frac[n..];
+        integer = false;
+    }
+    if let Some(exp) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
+        let exp = exp
+            .strip_prefix(b"+")
+            .or_else(|| exp.strip_prefix(b"-"))
+            .unwrap_or(exp);
+        if exp.is_empty() || !exp.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        rest = &[];
+        integer = false;
+    }
+    rest.is_empty().then_some(integer)
+}
+
+/// Whether two differing CSV cells are numbers within tolerance.
+fn cells_close(a: &str, b: &str, tol: Tolerance) -> bool {
+    if tol.rtol == 0.0 && tol.atol == 0.0 {
+        return false;
+    }
+    let (a, b) = (a.trim(), b.trim());
+    match (canonical_number(a), canonical_number(b)) {
+        (Some(true), Some(true)) => match (a.parse::<i128>(), b.parse::<i128>()) {
+            (Ok(x), Ok(y)) => ints_close(x, y, tol),
+            _ => false,
+        },
+        (Some(_), Some(_)) => match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => tol.close(x, y),
+            _ => false,
+        },
         _ => false,
     }
+}
+
+fn ints_close(x: i128, y: i128, tol: Tolerance) -> bool {
+    x == y || (x.abs_diff(y) as f64) <= tol.atol + tol.rtol * (x as f64).abs()
 }
 
 fn numbers_close(a: &Number, b: &Number, tol: Tolerance) -> bool {
@@ -183,7 +238,7 @@ fn numbers_close(a: &Number, b: &Number, tol: Tolerance) -> bool {
             .or_else(|| n.as_u64().map(i128::from))
     };
     if let (Some(x), Some(y)) = (int(a), int(b)) {
-        return x == y || ((x - y).abs() as f64) <= tol.atol + tol.rtol * (x as f64).abs();
+        return ints_close(x, y, tol);
     }
     match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) => tol.close(x, y),
@@ -342,6 +397,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.kept[0].location, "row count");
+    }
+
+    #[test]
+    fn csv_cells_are_text_at_zero_tolerance() {
+        let a = b"id,v,big\n00123,2.10,1700000000000000001\n";
+        let b = b"id,v,big\n123,2.1,1700000000000000002\n";
+        let d = compare(Kind::Delimited(b','), a, b, EXACT).unwrap();
+        assert_eq!(d.total, 3);
+        let loose = Tolerance {
+            rtol: 1e-6,
+            atol: 0.0,
+        };
+        let d = compare(Kind::Delimited(b','), a, b, loose).unwrap();
+        let locs: Vec<_> = d.kept.iter().map(|x| x.location.as_str()).collect();
+        // `00123` is not a canonical number, so it stays text; 2.10 and 2.1 are close;
+        // big integers are differenced exactly: |1| <= 1e-6 * 1.7e18.
+        assert_eq!(locs, ["row 2, column 1 (id)"]);
+        let tight = Tolerance {
+            rtol: 0.0,
+            atol: 0.5,
+        };
+        let d = compare(Kind::Delimited(b','), a, b, tight).unwrap();
+        assert_eq!(d.total, 2, "a difference of 1 exceeds atol 0.5");
+    }
+
+    #[test]
+    fn infinity_equals_only_itself() {
+        let loose = Tolerance {
+            rtol: 0.5,
+            atol: 0.0,
+        };
+        assert!(!loose.close(f64::INFINITY, 1.0));
+        assert!(!loose.close(1.0, f64::INFINITY));
+        assert!(!loose.close(f64::INFINITY, f64::NEG_INFINITY));
+        assert!(loose.close(f64::INFINITY, f64::INFINITY));
+        let d = compare(Kind::Delimited(b','), b"x\ninf\n", b"x\n1e308\n", loose).unwrap();
+        assert_eq!(d.total, 1);
+    }
+
+    #[test]
+    fn canonical_numbers() {
+        for s in ["0", "-1", "12", "0.5", "1e5", "-2.5E-3"] {
+            assert!(canonical_number(s).is_some(), "{s}");
+        }
+        for s in [
+            "00123", "+1", "1.", ".5", "1e", "1.2.3", "inf", "nan", "0x10", "",
+        ] {
+            assert!(canonical_number(s).is_none(), "{s}");
+        }
     }
 
     #[test]
