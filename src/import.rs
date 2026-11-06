@@ -13,7 +13,9 @@ use serde_json::{Map, Value, json};
 
 use crate::finding::{Finding, Report, Severity};
 use crate::hash::{normalize_sha256, sha256_bytes};
-use crate::manifest::{Expect, Header, Manifest, Record};
+use crate::manifest::{
+    Expect, Header, Manifest, Record, SCHEMA, Summary, absolute_lenient, origin_locator,
+};
 
 pub const PATH_KEYS: &[&str] = &[
     "path",
@@ -34,7 +36,9 @@ pub const HASH_KEYS: &[&str] = &[
     "checksum",
     "digest",
 ];
-const BYTES_KEYS: &[&str] = &["bytes", "size", "size_bytes", "length"];
+/// Generic byte-count fields. `size` and `length` are left out: they often hold something
+/// else (a page count, a duration), and a wrong size must never fail a matching hash.
+const BYTES_KEYS: &[&str] = &["bytes", "size_bytes", "byte_size", "file_size"];
 
 pub struct ImportOptions {
     pub json: PathBuf,
@@ -51,21 +55,15 @@ pub struct ImportOptions {
 
 /// A field name, or a JSON pointer into the record when it starts with `/`.
 fn field<'a>(obj: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
-    match name.strip_prefix('/') {
-        Some(_) => {
-            let mut v = None;
-            for (i, part) in name.split('/').skip(1).enumerate() {
-                let part = part.replace("~1", "/").replace("~0", "~");
-                v = if i == 0 {
-                    obj.get(&part)
-                } else {
-                    v.and_then(|x: &Value| x.get(&part))
-                };
-            }
-            v
-        }
-        None => obj.get(name),
-    }
+    let Some(pointer) = name.strip_prefix('/') else {
+        return obj.get(name);
+    };
+    let (first, rest) = match pointer.find('/') {
+        Some(i) => (&pointer[..i], &pointer[i..]),
+        None => (pointer, ""),
+    };
+    let first = first.replace("~1", "/").replace("~0", "~");
+    obj.get(&first)?.pointer(rest)
 }
 
 fn escape(key: &str) -> String {
@@ -89,15 +87,20 @@ fn pairs(obj: &Map<String, Value>, opts: &ImportOptions) -> (Vec<Pair>, Vec<Stri
             Some(f) => vec![f.clone()],
             None => d.iter().map(|s| (*s).to_owned()).collect(),
         };
-        let (Some(path), Some(hash)) = (
-            first(&own(&opts.path_field, PATH_KEYS)),
-            first(&own(&opts.hash_field, HASH_KEYS)),
-        ) else {
+        let Some(hash) = first(&own(&opts.hash_field, HASH_KEYS)) else {
             return (Vec::new(), Vec::new());
+        };
+        let Some(path) = first(&own(&opts.path_field, PATH_KEYS)) else {
+            let named = field(obj, &hash).is_some_and(|v| !v.is_null());
+            return (Vec::new(), if named { vec![hash] } else { Vec::new() });
         };
         let bytes = bytes_for(&own(&opts.bytes_field, BYTES_KEYS));
         return (vec![Pair { path, hash, bytes }], Vec::new());
     }
+    let generic_sizes: Vec<String> = match &opts.bytes_field {
+        Some(f) => vec![f.clone()],
+        None => BYTES_KEYS.iter().map(|s| (*s).to_owned()).collect(),
+    };
     let mut hash_keys: Vec<&str> = HASH_KEYS
         .iter()
         .copied()
@@ -115,7 +118,7 @@ fn pairs(obj: &Map<String, Value>, opts: &ImportOptions) -> (Vec<Pair>, Vec<Stri
         let (paths, sizes): (Vec<String>, Vec<String>) = if generic {
             (
                 PATH_KEYS.iter().map(|s| (*s).to_owned()).collect(),
-                BYTES_KEYS.iter().map(|s| (*s).to_owned()).collect(),
+                generic_sizes.clone(),
             )
         } else {
             let p = &h[..h.len() - "sha256".len()];
@@ -124,7 +127,7 @@ fn pairs(obj: &Map<String, Value>, opts: &ImportOptions) -> (Vec<Pair>, Vec<Stri
                     .iter()
                     .map(|s| format!("{p}{s}"))
                     .collect(),
-                ["bytes", "size"]
+                ["bytes", "size_bytes"]
                     .iter()
                     .map(|s| format!("{p}{s}"))
                     .collect(),
@@ -264,6 +267,9 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
         all_objects(&doc, String::new(), &mut objects);
     } else {
         for p in &opts.records {
+            if !p.is_empty() && !p.starts_with('/') {
+                bail!("--records {p:?} is not a JSON pointer; it must start with \"/\"");
+            }
             let found = resolve(&doc, p);
             if found.is_empty() {
                 bail!("{label}: JSON pointer {p:?} matches nothing");
@@ -295,7 +301,8 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
                 .or_default() += 1;
         }
         for pair in found {
-            let origin = format!("{ptr} ({}, {})", pair.path, pair.hash);
+            let fields = vec![pair.path.clone(), pair.hash.clone()];
+            let origin = origin_locator(ptr, &fields);
             let g = groups
                 .entry((shape(ptr), pair.path.clone(), pair.hash.clone()))
                 .or_default();
@@ -345,6 +352,8 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
             };
             if let Some(&j) = index.get(&path) {
                 let prev = &mut records[j];
+                let prev_at =
+                    origin_locator(prev.origin.as_deref().unwrap_or("?"), &prev.origin_fields);
                 let Expect::File {
                     bytes: pb,
                     sha256: ph,
@@ -361,13 +370,12 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
                             Severity::Error,
                             &path,
                             format!(
-                                "listed again with different content; the first entry ({}) is verified",
-                                prev.origin.as_deref().unwrap_or("?")
+                                "listed again with different content; the first entry ({prev_at}) is verified"
                             ),
                         )
                         .with_evidence(&label, &origin)
                         .with_data(json!({
-                            "first": {"origin": prev.origin, "bytes": *pb, "sha256": *ph},
+                            "first": {"origin": prev_at, "bytes": *pb, "sha256": *ph},
                             "other": {"origin": origin, "bytes": size, "sha256": sha256},
                         })),
                     );
@@ -389,7 +397,8 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
                     sha256,
                 },
                 mtime: None,
-                origin: Some(origin),
+                origin: Some(ptr.clone()),
+                origin_fields: fields,
             });
         }
     }
@@ -454,8 +463,26 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
         .map(Path::to_path_buf)
         .unwrap_or_default();
     let root = match &opts.root {
-        Some(r) => r.clone(),
+        // Stored absolute, so a later verify from another directory finds the same files.
+        Some(r) => {
+            absolute_lenient(r).with_context(|| format!("cannot resolve {}", r.display()))?
+        }
         None => choose_root(&json_dir, &records, opts.find_root, &label, &mut report),
+    };
+    records.sort_by(|a, b| a.path.cmp(&b.path));
+    let summary = Summary {
+        schema: SCHEMA.to_owned(),
+        kind: "summary".to_owned(),
+        files: records.len() as u64,
+        symlinks: 0,
+        bytes: records
+            .iter()
+            .map(|r| match r.expect {
+                Expect::File { bytes, .. } => bytes.unwrap_or(0),
+                Expect::Symlink { .. } => 0,
+            })
+            .sum(),
+        errors: Vec::new(),
     };
     let mut header = Header::new(Some(root.to_string_lossy().into_owned()));
     header.complete = false;
@@ -468,7 +495,7 @@ pub fn import(opts: &ImportOptions) -> Result<(Manifest, Report)> {
         Manifest {
             header,
             records,
-            summary: None,
+            summary: Some(summary),
             problems: Vec::new(),
         },
         report,

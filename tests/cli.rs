@@ -987,3 +987,267 @@ fn run_records_git_state_without_the_state_dir() {
     );
     assert_eq!(g["dirty_sha256"].as_str().unwrap().len(), 64);
 }
+
+fn has(f: &[Value], rule: &str, subject: &str) -> bool {
+    f.iter()
+        .any(|x| x["rule"] == rule && x["subject"] == subject)
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn import_hash_match_wins_over_size_fields() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a.txt"), b"alpha\n");
+    let h = prov::hash::sha256_bytes(b"alpha\n");
+    // `size` and `length` are not byte counts; `bytes` is, but a matching hash still wins.
+    let j = format!(
+        r#"[{{"path": "a.txt", "sha256": "{h}", "size": 999, "length": 3}},
+            {{"file": "a.txt", "hash": "{h}", "bytes": 7}}]"#
+    );
+    write(&d.join("m.json"), j.as_bytes());
+    let out = prov(d, &["manifest", "import", "m.json", "--format", "jsonl"]);
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert_eq!(summary(&f, "verify-summary")["ok"], 1);
+    assert_eq!(summary(&f, "verify-summary")["changed"], 0);
+    // Only one record (same path, same hash); the size came from the second object.
+    assert!(has(&f, "bytes-mismatch", "a.txt"), "{f:?}");
+    // --bytes-field alone is honoured for generically paired objects.
+    let j = format!(r#"[{{"path": "a.txt", "sha256": "{h}", "n": 999}}]"#);
+    write(&d.join("n.json"), j.as_bytes());
+    let out = prov(
+        d,
+        &[
+            "manifest",
+            "import",
+            "n.json",
+            "--bytes-field",
+            "n",
+            "--format",
+            "jsonl",
+        ],
+    );
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert!(has(&f, "bytes-mismatch", "a.txt"), "{f:?}");
+}
+
+#[test]
+fn import_root_is_stored_absolute() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("data/a.txt"), b"alpha\n");
+    let h = prov::hash::sha256_bytes(b"alpha\n");
+    write(
+        &d.join("m.json"),
+        format!(r#"[{{"path": "a.txt", "sha256": "{h}"}}]"#).as_bytes(),
+    );
+    let out = prov(
+        d,
+        &[
+            "manifest", "import", "m.json", "--root", "data", "-o", "m.jsonl",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    fs::create_dir_all(d.join("elsewhere")).unwrap();
+    let out = prov(
+        &d.join("elsewhere"),
+        &["manifest", "verify", "../m.jsonl", "--format", "jsonl"],
+    );
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert_eq!(summary(&f, "verify-summary")["ok"], 1);
+}
+
+#[test]
+fn import_output_is_sorted_with_summary_and_pointer_origins() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let h = |s: &str| prov::hash::sha256_bytes(s.as_bytes());
+    for n in ["b", "a", "c"] {
+        write(&d.join(n), n.as_bytes());
+    }
+    let j = format!(
+        r#"{{"files": [{{"path": "b", "sha256": "{}"}}, {{"path": "a", "sha256": "{}"}}, {{"path": "c", "sha256": "{}"}}]}}"#,
+        h("b"),
+        h("a"),
+        h("c")
+    );
+    write(&d.join("m.json"), j.as_bytes());
+    let out = prov(d, &["manifest", "import", "m.json", "-o", "m.jsonl"]);
+    assert_eq!(out.status.code(), Some(0));
+    let lines: Vec<Value> = fs::read_to_string(d.join("m.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let paths: Vec<&str> = lines[1..4]
+        .iter()
+        .map(|l| l["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["a", "b", "c"]);
+    assert_eq!(lines[1]["origin"], "/files/1");
+    assert_eq!(
+        lines[1]["origin_fields"],
+        serde_json::json!(["path", "sha256"])
+    );
+    assert_eq!(lines[4]["type"], "summary");
+    assert_eq!(lines[4]["files"], 3);
+    // The summary makes truncation detectable.
+    let cut: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 2)
+        .map(|(_, l)| l.to_string())
+        .collect();
+    write(&d.join("cut.jsonl"), (cut.join("\n") + "\n").as_bytes());
+    let out = prov(d, &["manifest", "verify", "cut.jsonl", "--format", "jsonl"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        rules(&findings(&out))
+            .iter()
+            .any(|(r, _)| r == "manifest-truncated")
+    );
+}
+
+#[test]
+fn import_explicit_fields_report_entries_without_paths() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a"), b"a");
+    let h = prov::hash::sha256_bytes(b"a");
+    let j = format!(r#"[{{"p": "a", "h": "{h}"}}, {{"h": "{h}"}}, {{"p": null, "h": "{h}"}}]"#);
+    write(&d.join("m.json"), j.as_bytes());
+    let out = prov(
+        d,
+        &[
+            "manifest",
+            "import",
+            "m.json",
+            "--path-field",
+            "p",
+            "--hash-field",
+            "h",
+            "--format",
+            "jsonl",
+        ],
+    );
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert_eq!(summary(&f, "hash-without-path")["/*/h"], 1);
+    assert_eq!(
+        summary(&f, "record-without-path")["pointers"],
+        serde_json::json!(["/2"])
+    );
+}
+
+#[test]
+fn import_pointer_fields_index_arrays_and_records_must_be_pointers() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("a"), b"a");
+    let h = prov::hash::sha256_bytes(b"a");
+    let j = format!(r#"{{"items": [{{"files": [{{"p": "a"}}], "h": {{"v": "{h}"}}}}]}}"#);
+    write(&d.join("m.json"), j.as_bytes());
+    let args = [
+        "manifest",
+        "import",
+        "m.json",
+        "--path-field",
+        "/files/0/p",
+        "--hash-field",
+        "/h/v",
+    ];
+    let mut ok = args.to_vec();
+    ok.extend(["--records", "/items", "--format", "jsonl"]);
+    let out = prov(d, &ok);
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert_eq!(summary(&f, "verify-summary")["ok"], 1);
+    let mut bad = args.to_vec();
+    bad.extend(["--records", "items"]);
+    let out = prov(d, &bad);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("not a JSON pointer"));
+}
+
+#[test]
+fn manifest_build_failure_keeps_the_existing_output() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    write(&d.join("m.jsonl"), b"previous\n");
+    let out = prov(d, &["manifest", "build", "missing-dir", "-o", "m.jsonl"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(fs::read(d.join("m.jsonl")).unwrap(), b"previous\n");
+    assert!(!d.join("m.jsonl.partial").exists());
+    // A successful build inside the root does not list its own partial file.
+    tree(&d.join("r"));
+    let out = prov(d, &["manifest", "build", "r", "-o", "r/m.jsonl"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = fs::read_to_string(d.join("r/m.jsonl")).unwrap();
+    assert!(!text.contains("\"path\":\"m.jsonl"), "{text}");
+}
+
+#[test]
+fn build_include_and_exclude_directories() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    tree(&d.join("r"));
+    let out = prov(
+        d,
+        &["manifest", "build", "r", "--include", "sub", "--no-mtime"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("\"path\":\"sub/c.txt") && !text.contains("\"path\":\"a.txt"),
+        "{text}"
+    );
+    let out = prov(
+        d,
+        &["manifest", "build", "r", "--exclude", "sub/", "--no-mtime"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("\"path\":\"sub/") && text.contains("\"path\":\"a.txt"),
+        "{text}"
+    );
+}
+
+#[test]
+fn diff_treats_unrecorded_paths_as_unchecked() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    tree(&d.join("r"));
+    let a = build(d, &d.join("r"), "a.jsonl");
+    // b: the same tree, but a.txt could not be read when b was built.
+    let mut lines: Vec<Value> = fs::read_to_string(&a)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|l: &Value| l["path"] != "a.txt")
+        .collect();
+    let s = lines.last_mut().unwrap();
+    s["files"] = (s["files"].as_u64().unwrap() - 1).into();
+    s["errors"] = serde_json::json!([{"path": "a.txt", "reason": "permission denied"}]);
+    let b: Vec<String> = lines.iter().map(Value::to_string).collect();
+    write(&d.join("b.jsonl"), (b.join("\n") + "\n").as_bytes());
+    let out = prov(
+        d,
+        &[
+            "manifest", "diff", "a.jsonl", "b.jsonl", "--format", "jsonl",
+        ],
+    );
+    let f = findings(&out);
+    assert_eq!(out.status.code(), Some(0), "{f:?}");
+    assert!(has(&f, "diff-unchecked", "a.txt"), "{f:?}");
+    assert!(!has(&f, "diff-removed", "a.txt"));
+}

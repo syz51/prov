@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -358,14 +357,7 @@ fn manifest_cmd(cmd: ManifestCmd) -> Result<u8> {
             };
             let clock = Instant::now();
             let stats = match &output {
-                Some(p) => {
-                    let f = File::create(p)
-                        .with_context(|| format!("cannot create {}", p.display()))?;
-                    let mut w = BufWriter::new(f);
-                    let s = manifest::build(&opts, &mut w)?;
-                    w.flush()?;
-                    s
-                }
+                Some(p) => manifest::write_atomic(p, |w| manifest::build(&opts, w))?,
                 None => manifest::build(&opts, &mut io::stdout().lock())?,
             };
             let mut err = io::stderr().lock();
@@ -454,10 +446,7 @@ fn manifest_cmd(cmd: ManifestCmd) -> Result<u8> {
             };
             let (m, mut report) = import::import(&opts)?;
             if let Some(p) = &output {
-                let mut w = BufWriter::new(
-                    File::create(p).with_context(|| format!("cannot create {}", p.display()))?,
-                );
-                manifest::write_manifest(&mut w, &m)?;
+                manifest::write_atomic(p, |w| manifest::write_manifest(w, &m))?;
             }
             if !no_verify {
                 let root = PathBuf::from(m.header.root.clone().unwrap_or_default());

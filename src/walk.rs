@@ -2,8 +2,10 @@
 //!
 //! A pattern without `/` matches a file or directory name at any depth; a pattern with `/`
 //! matches the path relative to the walk root, where `*` also crosses `/`. A leading `/`
-//! anchors a pattern to the root. Excluded
-//! directories are not descended into. Symbolic links are reported, never followed.
+//! anchors a pattern to the root; a trailing `/` is ignored. A pattern that matches a
+//! directory applies to everything under it: excluded directories are not descended into,
+//! and an included directory includes all its files. Symbolic links are reported, never
+//! followed.
 
 use std::path::{Path, PathBuf};
 
@@ -25,13 +27,17 @@ impl Patterns {
     pub fn new(patterns: &[String]) -> Result<Self> {
         let mut names = GlobSetBuilder::new();
         let mut paths = GlobSetBuilder::new();
-        for p in patterns {
+        for original in patterns {
+            let p = original.trim_end_matches('/');
+            if p.is_empty() {
+                bail!("invalid glob pattern {original:?}");
+            }
             if let Some(anchored) = p.strip_prefix('/') {
-                paths.add(glob(anchored, p)?);
+                paths.add(glob(anchored, original)?);
             } else if p.contains('/') {
-                paths.add(glob(p, p)?);
+                paths.add(glob(p, original)?);
             } else {
-                names.add(glob(p, p)?);
+                names.add(glob(p, original)?);
             }
         }
         Ok(Patterns {
@@ -47,6 +53,11 @@ impl Patterns {
     pub fn matches(&self, rel: &str) -> bool {
         let name = rel.rsplit('/').next().unwrap_or(rel);
         self.names.is_match(name) || self.paths.is_match(rel)
+    }
+
+    /// Whether `rel` or one of the directories containing it matches.
+    pub fn matches_self_or_ancestor(&self, rel: &str) -> bool {
+        self.matches(rel) || rel.match_indices('/').any(|(i, _)| self.matches(&rel[..i]))
     }
 }
 
@@ -180,7 +191,7 @@ pub fn walk(root: &Path, filter: &Filter, want_mtime: bool) -> Result<Walk> {
         if ft.is_dir() {
             continue;
         }
-        if !filter.include.is_empty() && !filter.include.matches(&rel) {
+        if !filter.include.is_empty() && !filter.include.matches_self_or_ancestor(&rel) {
             continue;
         }
         if ft.is_symlink() {
@@ -264,6 +275,11 @@ mod tests {
         ])
         .unwrap();
         assert!(p.matches("top.txt"));
+        let dir = Patterns::new(&["data/".into(), "docs/tmp/".into()]).unwrap();
+        assert!(dir.matches("x/data"));
+        assert!(dir.matches("docs/tmp"));
+        assert!(dir.matches_self_or_ancestor("x/data/a/b.txt"));
+        assert!(!dir.matches_self_or_ancestor("x/database/b.txt"));
         assert!(!p.matches("a/top.txt"));
         assert!(p.matches("a/b/c.pdf"));
         assert!(p.matches("x/build"));

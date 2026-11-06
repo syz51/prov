@@ -82,8 +82,10 @@ pub struct Record {
     pub path: String,
     pub expect: Expect,
     pub mtime: Option<String>,
-    /// Where the record came from in a foreign manifest (a JSON pointer).
+    /// Where the record came from in a foreign manifest: a JSON pointer to the object.
     pub origin: Option<String>,
+    /// The path and hash field names within that object.
+    pub origin_fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,6 +100,8 @@ struct FileLine {
     mtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    origin_fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,6 +153,7 @@ pub fn write_record(out: &mut dyn Write, rec: &Record) -> Result<()> {
                 sha256: sha256.clone(),
                 mtime: rec.mtime.clone(),
                 origin: rec.origin.clone(),
+                origin_fields: rec.origin_fields.clone(),
             },
         )?,
         Expect::Symlink { target } => serde_json::to_writer(
@@ -264,6 +269,7 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
                     },
                     mtime: l.mtime,
                     origin: l.origin,
+                    origin_fields: l.origin_fields,
                 }
             }
             "symlink" => {
@@ -274,6 +280,7 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
                     expect: Expect::Symlink { target: l.target },
                     mtime: None,
                     origin: None,
+                    origin_fields: Vec::new(),
                 }
             }
             other => {
@@ -307,34 +314,34 @@ pub fn read_manifest(path: &Path) -> Result<Manifest> {
     let Some(header) = header else {
         bail!("{label}: empty manifest");
     };
-    if header.complete {
-        match &summary {
-            None => problems.push(Finding::new(
-                "manifest-truncated",
-                Severity::Error,
-                &label,
-                "manifest has no summary record; it may be truncated",
-            )),
-            Some(s) => {
-                let files = records
-                    .iter()
-                    .filter(|r| matches!(r.expect, Expect::File { .. }))
-                    .count() as u64;
-                let links = records.len() as u64 - files;
-                if s.files != files || s.symlinks != links {
-                    problems.push(
-                        Finding::new(
-                            "manifest-truncated",
-                            Severity::Error,
-                            &label,
-                            format!(
-                                "summary lists {} files and {} symlinks but the manifest has {files} and {links}",
-                                s.files, s.symlinks
-                            ),
-                        )
-                        .with_data(json!({"summary_files": s.files, "summary_symlinks": s.symlinks, "files": files, "symlinks": links})),
-                    );
-                }
+    // A summary is required of a complete manifest and checked whenever present.
+    match &summary {
+        None if !header.complete => {}
+        None => problems.push(Finding::new(
+            "manifest-truncated",
+            Severity::Error,
+            &label,
+            "manifest has no summary record; it may be truncated",
+        )),
+        Some(s) => {
+            let files = records
+                .iter()
+                .filter(|r| matches!(r.expect, Expect::File { .. }))
+                .count() as u64;
+            let links = records.len() as u64 - files;
+            if s.files != files || s.symlinks != links {
+                problems.push(
+                    Finding::new(
+                        "manifest-truncated",
+                        Severity::Error,
+                        &label,
+                        format!(
+                            "summary lists {} files and {} symlinks but the manifest has {files} and {links}",
+                            s.files, s.symlinks
+                        ),
+                    )
+                    .with_data(json!({"summary_files": s.files, "summary_symlinks": s.symlinks, "files": files, "symlinks": links})),
+                );
             }
         }
     }
@@ -378,6 +385,39 @@ pub fn absolute_lenient(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Where an output file is written before it is renamed into place.
+pub fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
+}
+
+/// Writes `path` through `<path>.partial`, renaming it into place only if `write` succeeds,
+/// so a failed write never leaves a truncated or half-written file under the final name.
+pub fn write_atomic<T>(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<T>) -> Result<T> {
+    let tmp = partial_path(path);
+    let file =
+        std::fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+    let mut w = std::io::BufWriter::new(file);
+    let result = write(&mut w).and_then(|v| {
+        w.flush()?;
+        Ok(v)
+    });
+    drop(w);
+    match result {
+        Ok(v) => {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("cannot rename {} into place", tmp.display()))?;
+            Ok(v)
+        }
+        Err(e) => {
+            // The partial file is ours and incomplete; the original error is what matters.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 pub fn build(opts: &BuildOptions, out: &mut dyn Write) -> Result<BuildStats> {
     let root = opts
         .root
@@ -385,10 +425,12 @@ pub fn build(opts: &BuildOptions, out: &mut dyn Write) -> Result<BuildStats> {
         .with_context(|| format!("cannot open {}", opts.root.display()))?;
     let mut excludes = opts.excludes.clone();
     if let Some(output) = &opts.output {
-        let abs = absolute_lenient(output)?;
-        if let Ok(rel) = abs.strip_prefix(&root) {
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            excludes.push(format!("/{}", globset::escape(&rel)));
+        for p in [output.clone(), partial_path(output)] {
+            let abs = absolute_lenient(&p)?;
+            if let Ok(rel) = abs.strip_prefix(&root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                excludes.push(format!("/{}", globset::escape(&rel)));
+            }
         }
     }
     let filter = Filter::new(&opts.includes, &excludes, 0)?;
@@ -404,6 +446,7 @@ pub fn build(opts: &BuildOptions, out: &mut dyn Write) -> Result<BuildStats> {
                 },
                 mtime: None,
                 origin: None,
+                origin_fields: Vec::new(),
             }),
             EntryKind::File { bytes, mtime } => match hash_file(&e.abs) {
                 Ok((n, sha)) if n == *bytes => Ok(Record {
@@ -414,6 +457,7 @@ pub fn build(opts: &BuildOptions, out: &mut dyn Write) -> Result<BuildStats> {
                     },
                     mtime: mtime.clone(),
                     origin: None,
+                    origin_fields: Vec::new(),
                 }),
                 Ok((n, _)) => Err(Skipped {
                     path: e.rel.clone(),
@@ -483,6 +527,10 @@ enum Outcome {
     LinkChanged {
         target: Option<String>,
     },
+    /// Content matches the listed SHA-256 but the listed size does not.
+    SizeMismatch {
+        bytes: u64,
+    },
     Unreadable(String),
 }
 
@@ -507,19 +555,20 @@ fn check_record(root: &Path, rec: &Record) -> Outcome {
             if !meta.is_file() {
                 return Outcome::Unreadable("not a regular file".to_owned());
             }
-            if let Some(b) = bytes
-                && meta.len() != *b
-            {
-                return Outcome::Changed {
-                    bytes: meta.len(),
-                    sha256: None,
-                };
-            }
             let Some(expected) = sha256 else {
-                return Outcome::Unchecked { bytes: meta.len() };
+                // Without a hash, a size difference is the only evidence available.
+                return match bytes {
+                    Some(b) if meta.len() != *b => Outcome::Changed {
+                        bytes: meta.len(),
+                        sha256: None,
+                    },
+                    _ => Outcome::Unchecked { bytes: meta.len() },
+                };
             };
+            // With a hash, content decides; a listed size never overrides it.
             match hash_file(&path) {
                 Ok((n, got)) if &got == expected && bytes.is_none_or(|b| b == n) => Outcome::Ok,
+                Ok((n, got)) if &got == expected => Outcome::SizeMismatch { bytes: n },
                 Ok((n, got)) => Outcome::Changed {
                     bytes: n,
                     sha256: Some(got),
@@ -530,9 +579,18 @@ fn check_record(root: &Path, rec: &Record) -> Outcome {
     }
 }
 
+/// The evidence locator for an imported record: its JSON pointer and field names.
+pub fn origin_locator(origin: &str, fields: &[String]) -> String {
+    if fields.is_empty() {
+        origin.to_owned()
+    } else {
+        format!("{origin} ({})", fields.join(", "))
+    }
+}
+
 fn locate(f: Finding, label: &str, rec: &Record) -> Finding {
     match &rec.origin {
-        Some(o) => f.with_evidence(label, o.clone()),
+        Some(o) => f.with_evidence(label, origin_locator(o, &rec.origin_fields)),
         None => f,
     }
 }
@@ -614,6 +672,27 @@ pub fn verify(m: &Manifest, root: &Path, label: &str) -> Result<Report> {
                             "actual": {"bytes": bytes, "sha256": sha256},
                         }),
                     ),
+                    label,
+                    rec,
+                ));
+            }
+            Outcome::SizeMismatch { bytes } => {
+                *counts.get_mut("ok").unwrap() += 1;
+                let listed = match &rec.expect {
+                    Expect::File { bytes, .. } => *bytes,
+                    Expect::Symlink { .. } => None,
+                };
+                report.push(locate(
+                    Finding::new(
+                        "bytes-mismatch",
+                        Severity::Warn,
+                        &rec.path,
+                        format!(
+                            "content matches the listed sha256, but the listed size ({}) differs from the file ({bytes} bytes); the size field may mean something else",
+                            listed.map_or("?".to_owned(), |b| format!("{b} bytes"))
+                        ),
+                    )
+                    .with_data(json!({"listed_bytes": listed, "bytes": bytes})),
                     label,
                     rec,
                 ));
@@ -798,6 +877,30 @@ pub fn diff(a: &Manifest, b: &Manifest) -> Report {
         .map(|(_, r)| *r)
         .collect();
     let (mut changed, mut unchecked, mut same, mut moved) = (0u64, 0u64, 0u64, 0u64);
+    // A path the other build could not record is not evidence of removal or addition.
+    let unrecorded = |m: &Manifest| -> HashMap<String, String> {
+        m.summary
+            .iter()
+            .flat_map(|s| &s.errors)
+            .map(|e| (e.path.clone(), e.reason.clone()))
+            .collect()
+    };
+    let (a_err, b_err) = (unrecorded(a), unrecorded(b));
+    let mut not_compared = |r: &Record, errs: &HashMap<String, String>, which: &str| -> bool {
+        let Some(reason) = errs.get(&r.path) else {
+            return false;
+        };
+        unchecked += 1;
+        report.push(Finding::new(
+            "diff-unchecked",
+            Severity::Warn,
+            &r.path,
+            format!("the {which} manifest could not record this path ({reason}); not compared"),
+        ));
+        true
+    };
+    removed.retain(|r| !not_compared(r, &b_err, "second"));
+    added.retain(|r| !not_compared(r, &a_err, "first"));
     for (p, ra) in &am {
         let Some(rb) = bm.get(p) else { continue };
         match (&ra.expect, &rb.expect) {
