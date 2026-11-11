@@ -1685,10 +1685,10 @@ fn rerun_compares_the_exit_signal() {
 #[cfg(unix)]
 #[test]
 fn failure_after_the_command_started_exits_125() {
-    use std::os::unix::fs::PermissionsExt;
     let t = tempfile::tempdir().unwrap();
     let d = t.path();
-    // The command makes the runs directory read-only, so the record cannot be written.
+    // The command removes the runs directory, so the record cannot be written. Unlike a
+    // permission change, this also fails for root.
     let out = prov(
         d,
         &[
@@ -1698,14 +1698,14 @@ fn failure_after_the_command_started_exits_125() {
             "--no-git",
             "--no-streams",
             "--",
-            "chmod",
-            "500",
+            "rm",
+            "-r",
             "s/runs",
         ],
     );
-    fs::set_permissions(d.join("s/runs"), fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("the command ran"), "{err}");
     assert!(err.contains("\"schema\": \"rf.run/1\""), "{err}");
+    assert!(!d.join("s/runs").exists());
 }
