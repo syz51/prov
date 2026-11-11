@@ -440,6 +440,10 @@ with `tool: "prov"`. Each record is one JSON object per line:
 - Reruns isolate only declared inputs and outputs; a command can still read or write
   anything it names by absolute path.
 
+## Versioning
+
+Every pull request that changes the tool's behaviour raises the version in `Cargo.toml` and `Cargo.lock`.
+
 ## Licence
 
 MIT OR Apache-2.0.
