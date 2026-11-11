@@ -1580,6 +1580,44 @@ fn interrupts_reach_the_command_and_the_record_is_still_written() {
 
 #[cfg(unix)]
 #[test]
+fn the_command_starts_with_the_interrupt_disposition_prov_started_with() {
+    use std::os::unix::process::CommandExt;
+    // prov ignores interrupts itself; the command must not inherit that. The command
+    // interrupts itself: it dies when prov started with the default disposition and survives
+    // when prov started with interrupts ignored, as under `nohup`.
+    for (disposition, code, signal) in [
+        (libc::SIG_DFL, Some(128 + libc::SIGINT), Some(libc::SIGINT)),
+        (libc::SIG_IGN, Some(0), None),
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_prov"));
+        command.current_dir(d).args([
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "kill -INT $$; echo after",
+        ]);
+        // SAFETY: `signal` is async-signal-safe and the closure does nothing else.
+        unsafe {
+            command.pre_exec(move || {
+                libc::signal(libc::SIGINT, disposition);
+                Ok(())
+            });
+        }
+        let out = command.output().expect("run prov");
+        assert_eq!(out.status.code(), code, "{}", stderr(&out));
+        let (_, v) = record(&d.join("s"));
+        assert_eq!(v["exit"]["signal"].as_i64(), signal.map(i64::from));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn killed_run_leaves_an_incomplete_marker() {
     let t = tempfile::tempdir().unwrap();
     let d = t.path();

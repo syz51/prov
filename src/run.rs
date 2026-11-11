@@ -765,6 +765,10 @@ fn placeholder(id: &str) -> String {
 
 /// While alive, prov ignores the terminal's interrupt and quit signals, so Ctrl-C stops the
 /// command (which shares the terminal's process group) while prov still writes its record.
+///
+/// It must exist before the command starts: a signal that arrives between the spawn and a later
+/// guard would kill prov. The command must not inherit the ignored signals, so `restore_in`
+/// gives it back the dispositions prov itself started with.
 struct IgnoreInterrupts {
     #[cfg(unix)]
     previous: [(libc::c_int, libc::sighandler_t); 2],
@@ -785,17 +789,41 @@ impl IgnoreInterrupts {
     fn new() -> Self {
         IgnoreInterrupts {}
     }
+
+    /// Makes `command` start with the dispositions that prov had before this guard.
+    fn restore_in(&self, command: &mut Command) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let previous = self.previous;
+            // SAFETY: the closure runs in the forked child before exec and calls only
+            // `signal`, which is async-signal-safe; it allocates nothing and takes no lock.
+            unsafe {
+                command.pre_exec(move || {
+                    restore(previous);
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = command;
+    }
+}
+
+#[cfg(unix)]
+fn restore(previous: [(libc::c_int, libc::sighandler_t); 2]) {
+    for (sig, handler) in previous {
+        if handler != libc::SIG_ERR {
+            // SAFETY: restores the disposition returned by `signal` in `IgnoreInterrupts::new`.
+            unsafe { libc::signal(sig, handler) };
+        }
+    }
 }
 
 impl Drop for IgnoreInterrupts {
     fn drop(&mut self) {
         #[cfg(unix)]
-        for (sig, handler) in self.previous {
-            if handler != libc::SIG_ERR {
-                // SAFETY: restores the disposition returned by `signal` in `new`.
-                unsafe { libc::signal(sig, handler) };
-            }
-        }
+        restore(self.previous);
     }
 }
 
@@ -921,6 +949,8 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     };
     let streams = |ext: &str| spec.store_streams.then(|| format!("{id}.{ext}"));
     let (out_rel, err_rel) = (streams("stdout"), streams("stderr"));
+    // Ignore interrupts before the command exists, so that none can arrive unguarded.
+    let interrupts = IgnoreInterrupts::new();
     // Until the command starts, a failure leaves nothing behind.
     let start = || -> Result<(std::process::Child, Option<File>, Option<File>)> {
         let open = |rel: &Option<String>| -> Result<Option<File>> {
@@ -932,12 +962,15 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
                 .transpose()
         };
         let (out_file, err_file) = (open(&out_rel)?, open(&err_rel)?);
-        let child = Command::new(argv0)
+        let mut command = Command::new(argv0);
+        command
             .args(&spec.argv[1..])
             .current_dir(&spec.cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        interrupts.restore_in(&mut command);
+        let child = command
             .spawn()
             .with_context(|| format!("cannot start {argv0}"))?;
         Ok((child, out_file, err_file))
@@ -955,7 +988,6 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
             return Err(e);
         }
     };
-    let interrupts = IgnoreInterrupts::new();
     let after_start = |e: anyhow::Error| e.context(AfterStart { record: None });
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
