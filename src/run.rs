@@ -332,10 +332,23 @@ pub struct ProgramInfo {
     pub sha256: String,
 }
 
+/// The state of a record file. While the command runs, the file is a placeholder holding
+/// `"status": "incomplete"` and no other run fields; `read_record` refuses it. A finished
+/// record says `"status": "complete"` (since prov 0.1.2); records written before then have
+/// no `status` and read as complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordStatus {
+    #[default]
+    Complete,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub schema: String,
     pub id: String,
+    #[serde(default)]
+    pub status: RecordStatus,
     pub name: String,
     pub tool: String,
     pub tool_version: String,
@@ -1126,6 +1139,7 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     let record = RunRecord {
         schema: SCHEMA.to_owned(),
         id: id.clone(),
+        status: RecordStatus::Complete,
         name,
         tool: "prov".to_owned(),
         tool_version: crate::VERSION.to_owned(),

@@ -1709,3 +1709,49 @@ fn failure_after_the_command_started_exits_125() {
     assert!(err.contains("\"schema\": \"rf.run/1\""), "{err}");
     assert!(!d.join("s/runs").exists());
 }
+
+#[test]
+fn run_record_names_its_status_and_old_records_still_load() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (path, v) = record(&d.join("s"));
+    assert_eq!(v["status"], "complete");
+    let p = path.to_str().unwrap();
+    let verify = |v: &serde_json::Value| {
+        std::fs::write(&path, serde_json::to_vec(v).unwrap()).unwrap();
+        prov(d, &["run", "verify", p])
+    };
+
+    // A record written before prov 0.1.2 has no status and still reads as complete.
+    let mut old = v.clone();
+    old.as_object_mut().unwrap().remove("status");
+    assert_eq!(verify(&old).status.code(), Some(0));
+
+    // A placeholder cannot pass as a filled record, even with every run field present.
+    let mut half = v.clone();
+    half["status"] = "incomplete".into();
+    let out = verify(&half);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("incomplete record"));
+
+    // An unknown status is refused rather than read as complete.
+    let mut odd = v.clone();
+    odd["status"] = "filled".into();
+    let out = verify(&odd);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("invalid rf.run/1 record"));
+}
