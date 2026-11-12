@@ -197,7 +197,7 @@ prov run --in data/train.csv --in scripts/train.py --out results/metrics.json --
    outputs (`output-missing`, `output-unreadable`: error; `output-unchanged`: warn).
 5. Writes `<state_dir>/runs/<UTC time>-<name>.json` atomically and prints its path to stderr.
    The file is reserved when the command starts and holds `{"status": "incomplete", …}`
-   until then; if `prov` itself is killed, that marker remains, and `run verify`, `rerun`
+   until then, and the finished record holds `"status": "complete"`; if `prov` itself is killed, that marker remains, and `run verify`, `rerun`
    and `lineage` report it as an incomplete record.
 
 Exit status: the command's own status when it fails (`128 + signal` when killed), else `1`
@@ -363,8 +363,9 @@ record.
 {
   "schema": "rf.run/1",
   "id": "20261107T030000.123Z-train",
+  "status": "complete",
   "name": "train",
-  "tool": "prov", "tool_version": "0.1.0",
+  "tool": "prov", "tool_version": "0.1.2",
   "argv": ["uv", "run", "--no-project", "--with", "numpy==2.3.4", "python", "train.py"],
   "argv_redacted": [],
   "cwd": "/abs/path/project",
@@ -389,6 +390,7 @@ record.
 | Field | Meaning |
 | --- | --- |
 | `id` | record file stem: UTC start time to the millisecond, then the name; `-2`, `-3` … on collision |
+| `status` | `complete` (since 0.1.2); absent in older records, which read as complete. A placeholder holds `"incomplete"` and no run fields; readers refuse it and any other value |
 | `cwd` | absolute working directory; relative `inputs`/`outputs` paths resolve against it |
 | `git.status` | `ok`, `none` (not a work tree), `unavailable` (no git), `skipped` (`--no-git`) or `error`, with `reason` when not `ok`; `head` is `null` before the first commit, `branch` when detached |
 | `tools` | first line of each tool's version output; `null` when the tool could not be run |
