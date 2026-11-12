@@ -365,7 +365,7 @@ record.
   "id": "20261107T030000.123Z-train",
   "status": "complete",
   "name": "train",
-  "tool": "prov", "tool_version": "0.1.0",
+  "tool": "prov", "tool_version": "0.1.2",
   "argv": ["uv", "run", "--no-project", "--with", "numpy==2.3.4", "python", "train.py"],
   "argv_redacted": [],
   "cwd": "/abs/path/project",
