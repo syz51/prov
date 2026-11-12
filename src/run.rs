@@ -412,12 +412,10 @@ fn redact_url_credentials(value: &str) -> String {
     out
 }
 
-/// Words that make a command-line option a secret (`--api-key`, `--password`). Options
-/// match by whole word, unlike environment names, so `--keyframes`, `--author` and
-/// `--passes` keep their values.
+/// Words that make a command-line option a secret (`--token`, `--password`). Options
+/// match by whole word, unlike environment names, so `--author` and `--passes` keep their
+/// values. `KEY` is not here: see [`option_secrecy`].
 const SECRET_OPTION_WORDS: &[&str] = &[
-    "KEY",
-    "APIKEY",
     "TOKEN",
     "SECRET",
     "PASS",
@@ -433,26 +431,157 @@ const SECRET_OPTION_WORDS: &[&str] = &[
     "CREDENTIALS",
 ];
 
-/// Whether `name` (an option such as `--api-token`, or a `NAME` in `NAME=value`) names a
-/// secret.
-fn secret_option(name: &str) -> bool {
+/// Words that, right before `KEY`, name a lookup key rather than a secret one
+/// (`--sort-key`, `--primary-key`).
+const LOOKUP_KEY_QUALIFIERS: &[&str] = &[
+    "SORT",
+    "PRIMARY",
+    "FOREIGN",
+    "PARTITION",
+    "GROUP",
+    "JOIN",
+    "LOOKUP",
+    "INDEX",
+    "CACHE",
+    "DEDUP",
+    "MERGE",
+    "SPLIT",
+    "ID",
+    "RECORD",
+    "ROW",
+    "COLUMN",
+    "FIELD",
+    "CITE",
+    "CITATION",
+    "PAPER",
+];
+
+/// Prefixes of well-known credential formats. An argument that starts with one, followed
+/// by token characters holding a random-looking run, is a secret wherever it appears.
+const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "xapp-",
+    "hf_",
+    "npm_",
+    "pypi-",
+    "AKIA",
+    "AIza",
+];
+
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// True for a value in a well-known credential format: a PEM private key or a token with a
+/// prefix from [`SECRET_VALUE_PREFIXES`].
+fn known_secret_value(value: &str) -> bool {
+    value.starts_with("-----BEGIN")
+        || SECRET_VALUE_PREFIXES.iter().any(|p| {
+            value
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.chars().all(token_char) && has_random_run(rest))
+        })
+}
+
+/// True if `value` holds a run of at least 16 letters and digits that has both, as random
+/// tokens do and slugs, dates and words do not.
+fn has_random_run(value: &str) -> bool {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|run| {
+            run.len() >= 16
+                && run.chars().any(|c| c.is_ascii_alphabetic())
+                && run.chars().any(|c| c.is_ascii_digit())
+        })
+}
+
+/// True for a value shaped like a secret: a known credential format, or token or base64
+/// characters (`A-Za-z0-9_-+/=.`) holding a run of at least 16 letters and digits that has
+/// both. Slugs, dates and paths such as `paper-cards-2026-11-12` break into short runs and
+/// are not secret-shaped.
+fn secret_shaped(value: &str) -> bool {
+    known_secret_value(value)
+        || (value
+            .chars()
+            .all(|c| token_char(c) || matches!(c, '+' | '/' | '=' | '.'))
+            && has_random_run(value))
+}
+
+/// How an option's or variable's name bears on its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Secrecy {
+    /// The name says nothing about secrecy.
+    No,
+    /// The name names a secret: the value is redacted.
+    Always,
+    /// The name is a bare or lookup `KEY` option: the value is redacted only if it is
+    /// secret-shaped.
+    IfShaped,
+}
+
+/// How `name` (an option such as `--api-token`, or a `NAME` in `NAME=value`) bears on its
+/// value.
+fn option_secrecy(name: &str) -> Secrecy {
     let bare = name.trim_start_matches('-');
     if bare.is_empty() {
-        return false;
+        return Secrecy::No;
     }
     if name.starts_with('-') {
         let upper = bare.to_ascii_uppercase();
-        return upper
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|w| SECRET_OPTION_WORDS.contains(&w));
+        let words: Vec<&str> = upper.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+        if words.iter().any(|w| SECRET_OPTION_WORDS.contains(w)) {
+            return Secrecy::Always;
+        }
+        // A `KEY` word, or a word ending in `KEY` (`--apikey`, `--hmackey`), names a secret
+        // key unless the option is a bare `--key` or a lookup key such as `--sort-key`.
+        let mut lookup_key = false;
+        for (i, w) in words.iter().enumerate() {
+            if *w == "KEY" {
+                if words.len() == 1 || (i > 0 && LOOKUP_KEY_QUALIFIERS.contains(&words[i - 1])) {
+                    lookup_key = true;
+                } else {
+                    return Secrecy::Always;
+                }
+            } else if w.len() > 3 && w.ends_with("KEY") {
+                return Secrecy::Always;
+            }
+        }
+        return if lookup_key {
+            Secrecy::IfShaped
+        } else {
+            Secrecy::No
+        };
     }
     let variable = bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !bare.starts_with(|c: char| c.is_ascii_digit());
-    variable && is_secret_name(bare)
+    if variable && is_secret_name(bare) {
+        Secrecy::Always
+    } else {
+        Secrecy::No
+    }
 }
 
-/// Redacts URL credentials, `--secret=value`, `--secret value` and `SECRET=value`
-/// arguments. Returns the redacted argv and the indices that changed.
+/// Whether `value`, given to an option or variable of this secrecy, is redacted.
+fn redacts(secrecy: Secrecy, value: &str) -> bool {
+    match secrecy {
+        Secrecy::No => known_secret_value(value),
+        Secrecy::Always => true,
+        Secrecy::IfShaped => secret_shaped(value),
+    }
+}
+
+/// Redacts URL credentials, values in a known credential format, `--secret=value`,
+/// `--secret value` and `SECRET=value` arguments, and secret-shaped values of bare `KEY`
+/// options. Returns the redacted argv and the indices that changed.
 pub fn redact_argv(argv: &[String]) -> (Vec<String>, Vec<usize>) {
     let mut out: Vec<String> = argv.to_vec();
     let mut changed = BTreeSet::new();
@@ -464,15 +593,25 @@ pub fn redact_argv(argv: &[String]) -> (Vec<String>, Vec<usize>) {
         if i == 0 {
             continue;
         }
-        match argv[i].split_once('=') {
-            Some((name, value)) if !value.is_empty() && secret_option(name) => {
+        if known_secret_value(&argv[i]) {
+            out[i] = REDACTED.to_owned();
+            changed.insert(i);
+            continue;
+        }
+        // Split the URL-redacted text, so rebuilding `name=REDACTED` keeps URL
+        // credentials in `name` redacted.
+        match out[i].split_once('=') {
+            Some((name, value)) if !value.is_empty() && redacts(option_secrecy(name), value) => {
                 out[i] = format!("{name}={REDACTED}");
                 changed.insert(i);
             }
             Some(_) => {}
-            None if argv[i].starts_with('-') && secret_option(&argv[i]) => {
-                if let Some(next) = argv.get(i + 1)
+            None if argv[i].starts_with('-') => {
+                let secrecy = option_secrecy(&argv[i]);
+                if secrecy != Secrecy::No
+                    && let Some(next) = argv.get(i + 1)
                     && !next.starts_with('-')
+                    && redacts(secrecy, next)
                 {
                     out[i + 1] = REDACTED.to_owned();
                     changed.insert(i + 1);
@@ -2049,7 +2188,7 @@ mod tests {
             "--passes=3",
             "--db-password=pw",
             "GITHUB_PAT=g",
-            "--key",
+            "--api-key",
             "--verbose",
             "ok",
         ]
@@ -2065,6 +2204,103 @@ mod tests {
         // A secret option followed by another option takes no value.
         assert_eq!(out[10], "--verbose");
         assert_eq!(idx, [1, 3, 7, 8]);
+    }
+
+    #[test]
+    fn key_options_redact_only_secrets() {
+        let secret = "sk-ant-api03-AbCdEf0123456789xyz";
+        let argv: Vec<String> = [
+            "papers",
+            "card",
+            "--key",
+            "60",
+            "--sort-key=title",
+            "--api-key",
+            "short",
+            "--access-key=abc",
+            "--privatekey",
+            "p",
+            "--hmac-key",
+            "correct horse",
+            "--stripe-key=P@ss!",
+            "--sort-key",
+            "title",
+            "--key",
+            "Zx9Qw8Er7Ty6Ui5Op4As3Df2",
+            "--key=c2VjcmV0LXZhbHVlLTAxMjM0NTY3",
+            "--name",
+            secret,
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "deadbeef",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (out, idx) = redact_argv(&argv);
+        assert_eq!(out[3], "60", "a plain value after --key is a lookup key");
+        assert_eq!(out[4], "--sort-key=title");
+        assert_eq!(out[6], REDACTED);
+        assert_eq!(out[7], "--access-key=REDACTED");
+        assert_eq!(out[9], REDACTED);
+        assert_eq!(out[11], REDACTED, "any other KEY option is a secret key");
+        assert_eq!(out[12], "--stripe-key=REDACTED");
+        assert_eq!(out[14], "title");
+        assert_eq!(out[16], REDACTED, "a secret-shaped value after --key");
+        assert_eq!(out[17], "--key=REDACTED");
+        assert_eq!(out[19], REDACTED, "a known token format anywhere");
+        assert_eq!(out[20], REDACTED);
+        assert_eq!(out[21], "deadbeef");
+        assert_eq!(idx, [6, 7, 9, 11, 12, 16, 17, 19, 20]);
+    }
+
+    #[test]
+    fn url_credentials_survive_a_redacted_query_value() {
+        let argv: Vec<String> = [
+            "git",
+            // Split so secret scanners do not flag this fake token.
+            concat!(
+                "https://user:pass@git.invalid/r?private_token=glpat",
+                "-0123456789abcdefABCD"
+            ),
+            "sk-resnet-baseline-large",
+            "hf_datasets_cache_dir_v2",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (out, idx) = redact_argv(&argv);
+        assert_eq!(
+            out[1],
+            "https://REDACTED@git.invalid/r?private_token=REDACTED"
+        );
+        assert_eq!(
+            out[2], "sk-resnet-baseline-large",
+            "a prefix alone is not a secret"
+        );
+        assert_eq!(out[3], "hf_datasets_cache_dir_v2");
+        assert_eq!(idx, [1]);
+    }
+
+    #[test]
+    fn secret_shapes() {
+        for v in [
+            "ghp_0123456789abcdefABCDEF",
+            "AKIAIOSFODNN7EXAMPLE",
+            "hf_abcdefghij0123456789",
+            "Zx9Qw8Er7Ty6Ui5Op4As3Df2",
+            "3f2a9c0d4e5b6a7c8d9e0f1a2b3c4d5e",
+        ] {
+            assert!(secret_shaped(v), "{v}");
+        }
+        for v in [
+            "60",
+            "title",
+            "paper-cards-2026-11-12",
+            "data/cards/2026.json",
+            "sk-short",
+            "abcdefghijklmnopqrstuvwxyz",
+            "results/run-2026-11-12T05-14-07.json",
+        ] {
+            assert!(!secret_shaped(v), "{v}");
+        }
     }
 
     #[test]
