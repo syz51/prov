@@ -1194,6 +1194,8 @@ fn run_redacts_secrets_in_argv() {
             "--password",
             "pass-0451",
             "API_KEY=key-0451",
+            "--api-key",
+            "short-0451",
             "--keyframes",
             "12",
             "plain",
@@ -1207,17 +1209,52 @@ fn run_redacts_secrets_in_argv() {
     assert_eq!(v["argv"][2], "--token=REDACTED");
     assert_eq!(v["argv"][4], "REDACTED");
     assert_eq!(v["argv"][5], "API_KEY=REDACTED");
+    assert_eq!(v["argv"][7], "REDACTED");
     assert_eq!(
-        v["argv"][7], "12",
+        v["argv"][9], "12",
         "options match secret words whole, so --keyframes keeps its value"
     );
-    assert_eq!(v["argv_redacted"], serde_json::json!([1, 2, 4, 5]));
+    assert_eq!(v["argv_redacted"], serde_json::json!([1, 2, 4, 5, 7]));
     let out = prov(
         d,
         &["run", "rerun", path.to_str().unwrap(), "--state-dir", "s"],
     );
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("cannot be rerun"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_keeps_a_plain_key_value_and_stays_rerunnable() {
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "echo",
+            "card",
+            "--key",
+            "60",
+            "--force",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (path, v) = record(&d.join("s"));
+    assert_eq!(
+        v["argv"],
+        serde_json::json!(["echo", "card", "--key", "60", "--force"])
+    );
+    assert_eq!(v["argv_redacted"], serde_json::json!([]));
+    let out = prov(
+        d,
+        &["run", "rerun", path.to_str().unwrap(), "--state-dir", "s"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }
 
 #[test]

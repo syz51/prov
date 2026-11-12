@@ -225,10 +225,29 @@ as a whole `_`-separated part (`GITHUB_PAT`, `MYSQL_PWD`, but not `PATH`), or it
 embeds URL credentials (`scheme://user:pass@host`); its name, not its value, goes into
 `env_redacted`. The command itself always receives the full environment.
 
-**Arguments.** `argv` is recorded with secrets replaced by `REDACTED`: URL credentials
-(`https://REDACTED@host/…`), the value of an option whose name has a secret word as a
-whole `-`/`_`-separated part (`--token=…`, `--api-key …`, `--password …`; not `--keyframes`
-or `--author`), and `NAME=value` arguments whose `NAME` is secret by the environment rule.
+**Arguments.** `argv` is recorded with secrets replaced by `REDACTED`:
+
+- URL credentials (`https://REDACTED@host/…`).
+- An argument in a known credential format, wherever it appears: a PEM header
+  (`-----BEGIN …`), or a token prefix (`sk-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+  `github_pat_`, `glpat-`, `xoxb-`, `xoxp-`, `xapp-`, `hf_`, `npm_`, `pypi-`, `AKIA`,
+  `AIza`) followed by letters, digits, `_` or `-` that include a run of at least 16
+  letters and digits with both (so `sk-resnet-baseline-large` is kept).
+- The value of an option whose name has a secret word as a whole `-`/`_`-separated part:
+  `TOKEN`, `SECRET`, `PASS`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PWD`, `PAT`, `AUTH`,
+  `AUTHORIZATION`, `COOKIE`, `CREDENTIAL` or `CREDENTIALS` (`--token=…`, `--password …`;
+  not `--author` or `--passes`).
+- The value of a `KEY` option: `KEY` as a whole part, or a part ending in `KEY`
+  (`--api-key …`, `--hmac-key=…`, `--apikey …`; not `--keyframes`).
+- Except that a bare `--key`, or a lookup key (`KEY` right after `SORT`, `PRIMARY`,
+  `FOREIGN`, `PARTITION`, `GROUP`, `JOIN`, `LOOKUP`, `INDEX`, `CACHE`, `DEDUP`, `MERGE`,
+  `SPLIT`, `ID`, `RECORD`, `ROW`, `COLUMN`, `FIELD`, `CITE`, `CITATION` or `PAPER`, such as
+  `--sort-key`), has its value redacted only when it is secret-shaped: a known credential
+  format, or only letters, digits and `_-+/=.` with a run of at least 16 letters and
+  digits that has both (not a slug, date or path such as `paper-cards-2026-11-12`). So
+  `--key 60` is recorded as given and the run stays rerunnable.
+- `NAME=value` arguments whose `NAME` is secret by the environment rule.
+
 The indices of changed arguments are in `argv_redacted`, an `argv-redacted` warning is
 recorded, and such a record cannot be rerun. The command itself receives the real
 arguments.
@@ -365,7 +384,7 @@ record.
   "id": "20261107T030000.123Z-train",
   "status": "complete",
   "name": "train",
-  "tool": "prov", "tool_version": "0.1.2",
+  "tool": "prov", "tool_version": "0.1.3",
   "argv": ["uv", "run", "--no-project", "--with", "numpy==2.3.4", "python", "train.py"],
   "argv_redacted": [],
   "cwd": "/abs/path/project",
@@ -435,8 +454,11 @@ with `tool: "prov"`. Each record is one JSON object per line:
   blocks and are not detected, so the disk space actually freed can be smaller.
 - `manifest verify` follows a symlink in place of a listed file and checks its target's content.
 - A file modified while being hashed is detected only when its size changes.
-- Argument redaction is heuristic: a secret passed as a plain positional argument, or after
-  an option without a secret word in its name, is recorded as given.
+- Argument redaction is heuristic: a secret without a known credential format, passed as a
+  plain positional argument, after an option without a secret word in its name, or after a
+  bare or lookup `KEY` option without a secret shape, is recorded as given. In the other
+  direction, a hex digest or commit SHA after a bare `--key` is secret-shaped, so it is
+  redacted and that run cannot be rerun.
 - Run records hold absolute paths (`cwd`, `program`, `git.toplevel`) and the recorded
   environment; keep the state directory out of public repositories if that matters.
 - Reruns isolate only declared inputs and outputs; a command can still read or write
