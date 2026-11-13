@@ -1659,17 +1659,25 @@ fn the_command_starts_with_the_interrupt_dispositions_prov_started_with() {
     }
 }
 
-/// Runs `prov run -- sh -c 'touch ran'` in `d`, paused after it creates the placeholder record
-/// and before it writes it. Sends `sig` to prov during the pause, if given. With `fail_write`,
-/// prov may write no file content (RLIMIT_FSIZE 0, SIGXFSZ ignored), so the placeholder write
-/// fails. Returns prov's output and the files left in `runs/`.
+/// Called with prov's pid and `runs/` while prov is paused.
 #[cfg(all(unix, debug_assertions))]
-fn run_paused(d: &Path, sig: Option<i32>, fail_write: bool) -> (Output, Vec<PathBuf>) {
+type DuringPause<'a> = &'a dyn Fn(libc::pid_t, &Path);
+
+/// Runs `prov run -- sh -c 'touch ran'` in `d`, paused after it creates the placeholder record
+/// and before it writes it. Calls `during_pause` with prov's pid and `runs/` during the pause, if
+/// given. With `fail_write`, prov may write no file content (RLIMIT_FSIZE 0, SIGXFSZ ignored),
+/// so the placeholder write fails. Returns prov's output and the files left in `runs/`.
+#[cfg(all(unix, debug_assertions))]
+fn run_paused(
+    d: &Path,
+    during_pause: Option<DuringPause>,
+    fail_write: bool,
+) -> (Output, Vec<PathBuf>) {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let go = d.join("go");
-    if sig.is_none() {
+    if during_pause.is_none() {
         fs::write(&go, "").unwrap();
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_prov"));
@@ -1706,16 +1714,15 @@ fn run_paused(d: &Path, sig: Option<i32>, fail_write: bool) -> (Output, Vec<Path
     }
     let child = command.spawn().expect("run prov");
     let runs = d.join("s/runs");
-    if let Some(sig) = sig {
+    if let Some(during_pause) = during_pause {
         // prov pauses once the placeholder record exists.
         let deadline = Instant::now() + Duration::from_secs(30);
         while fs::read_dir(&runs).map_or(true, |mut r| r.next().is_none()) {
             assert!(Instant::now() < deadline, "no placeholder record");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: plain FFI call with a live child's pid.
-        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
-        // Let the signal land before prov goes on.
+        during_pause(child.id() as libc::pid_t, &runs);
+        // Let a signal land before prov goes on.
         std::thread::sleep(Duration::from_millis(100));
         fs::write(&go, "").unwrap();
     }
@@ -1728,13 +1735,22 @@ fn run_paused(d: &Path, sig: Option<i32>, fail_write: bool) -> (Output, Vec<Path
     (out, left)
 }
 
+/// Sends `sig` to the paused prov.
+#[cfg(all(unix, debug_assertions))]
+fn send(sig: i32) -> impl Fn(libc::pid_t, &Path) {
+    move |pid, _| {
+        // SAFETY: plain FFI call with a live child's pid.
+        assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+    }
+}
+
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn a_signal_before_the_command_starts_stops_it_and_leaves_no_record() {
     use std::os::unix::process::ExitStatusExt;
     for sig in [libc::SIGINT, libc::SIGQUIT] {
         let t = tempfile::tempdir().unwrap();
-        let (out, left) = run_paused(t.path(), Some(sig), false);
+        let (out, left) = run_paused(t.path(), Some(&send(sig)), false);
         assert_eq!(out.status.signal(), Some(sig), "{:?}", out.status);
         assert!(left.is_empty(), "{left:?}");
     }
@@ -1755,9 +1771,62 @@ fn a_failed_placeholder_write_leaves_no_record() {
 fn a_signal_before_a_failed_placeholder_write_still_ends_prov() {
     use std::os::unix::process::ExitStatusExt;
     let t = tempfile::tempdir().unwrap();
-    let (out, left) = run_paused(t.path(), Some(libc::SIGINT), true);
+    let (out, left) = run_paused(t.path(), Some(&send(libc::SIGINT)), true);
     assert_eq!(out.status.signal(), Some(libc::SIGINT), "{}", stderr(&out));
     assert!(left.is_empty(), "{left:?}");
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn a_placeholder_prov_cannot_remove_is_named_in_the_error() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain FFI call.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root may remove files from a read-only directory
+    }
+    let t = tempfile::tempdir().unwrap();
+    let lock = |_, runs: &Path| {
+        fs::set_permissions(runs, fs::Permissions::from_mode(0o555)).unwrap();
+    };
+    let (out, left) = run_paused(t.path(), Some(&lock), true);
+    fs::set_permissions(t.path().join("s/runs"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("cannot remove"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("cannot write"), "{}", stderr(&out));
+    assert_eq!(left.len(), 1, "{left:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_placeholder_prov_cannot_create_leaves_no_record() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain FFI call.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root may create files in a read-only directory
+    }
+    let t = tempfile::tempdir().unwrap();
+    let d = t.path();
+    let runs = d.join("s/runs");
+    fs::create_dir_all(&runs).unwrap();
+    fs::set_permissions(&runs, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = prov(
+        d,
+        &[
+            "run",
+            "--state-dir",
+            "s",
+            "--no-git",
+            "--",
+            "sh",
+            "-c",
+            "touch ran",
+        ],
+    );
+    fs::set_permissions(&runs, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("cannot create"), "{}", stderr(&out));
+    assert!(!d.join("ran").exists(), "the command ran");
+    assert_eq!(fs::read_dir(&runs).unwrap().count(), 0);
 }
 
 #[cfg(unix)]

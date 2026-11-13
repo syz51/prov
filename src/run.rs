@@ -1034,15 +1034,24 @@ impl Drop for CatchInterrupts {
 
 /// Ends a run that failed before its command started: removes the `files` it made in `runs`, so
 /// nothing is left behind, then dies by the signal that `interrupts` noted, if any, as prov
-/// would have without the guard. Returns the error to report otherwise.
+/// would have without the guard. Returns the error to report otherwise, naming each file it
+/// could not remove; a file that does not exist was never made.
 fn abandon(
-    e: anyhow::Error,
+    mut e: anyhow::Error,
     runs: &Path,
     files: impl IntoIterator<Item = String>,
     interrupts: CatchInterrupts,
 ) -> anyhow::Error {
     for f in files {
-        let _ = fs::remove_file(runs.join(f));
+        let path = runs.join(f);
+        if let Err(r) = fs::remove_file(&path)
+            && r.kind() != io::ErrorKind::NotFound
+        {
+            e = e.context(format!(
+                "cannot remove {}, left behind: {r}",
+                path.display()
+            ));
+        }
     }
     let Some(sig) = interrupts.pending() else {
         return e;
