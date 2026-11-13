@@ -1617,39 +1617,104 @@ fn interrupts_reach_the_command_and_the_record_is_still_written() {
 
 #[cfg(unix)]
 #[test]
-fn the_command_starts_with_the_interrupt_disposition_prov_started_with() {
+fn the_command_starts_with_the_interrupt_dispositions_prov_started_with() {
     use std::os::unix::process::CommandExt;
-    // prov ignores interrupts itself; the command must not inherit that. The command
-    // interrupts itself: it dies when prov started with the default disposition and survives
-    // when prov started with interrupts ignored, as under `nohup`.
-    for (disposition, code, signal) in [
-        (libc::SIG_DFL, Some(128 + libc::SIGINT), Some(libc::SIGINT)),
-        (libc::SIG_IGN, Some(0), None),
-    ] {
+    // prov catches interrupt and quit signals itself; the command must not inherit that. The
+    // command signals itself: it dies when prov started with the default disposition and
+    // survives when prov started with the signal ignored, as under `nohup`.
+    for (sig, name) in [(libc::SIGINT, "INT"), (libc::SIGQUIT, "QUIT")] {
+        for (disposition, code, signal) in [
+            (libc::SIG_DFL, Some(128 + sig), Some(sig)),
+            (libc::SIG_IGN, Some(0), None),
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            let d = t.path();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_prov"));
+            command.current_dir(d).args([
+                "run",
+                "--state-dir",
+                "s",
+                "--no-git",
+                "--",
+                "sh",
+                "-c",
+                &format!("ulimit -c 0; kill -{name} $$; echo after"),
+            ]);
+            // SAFETY: `signal` is async-signal-safe and the closure does nothing else.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::signal(sig, disposition);
+                    Ok(())
+                });
+            }
+            let out = command.output().expect("run prov");
+            assert_eq!(out.status.code(), code, "SIG{name}: {}", stderr(&out));
+            let (_, v) = record(&d.join("s"));
+            assert_eq!(
+                v["exit"]["signal"].as_i64(),
+                signal.map(i64::from),
+                "SIG{name}"
+            );
+        }
+    }
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn a_signal_before_the_command_starts_stops_it_and_leaves_no_record() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    for sig in [libc::SIGINT, libc::SIGQUIT] {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
+        let go = d.join("go");
         let mut command = Command::new(env!("CARGO_BIN_EXE_prov"));
-        command.current_dir(d).args([
-            "run",
-            "--state-dir",
-            "s",
-            "--no-git",
-            "--",
-            "sh",
-            "-c",
-            "kill -INT $$; echo after",
-        ]);
-        // SAFETY: `signal` is async-signal-safe and the closure does nothing else.
+        command
+            .current_dir(d)
+            .env("PROV_TEST_PAUSE_UNTIL", &go)
+            .args([
+                "run",
+                "--state-dir",
+                "s",
+                "--no-git",
+                "--",
+                "sh",
+                "-c",
+                "touch ran",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: `setrlimit` is async-signal-safe and the closure does nothing else. No core
+        // file for SIGQUIT.
         unsafe {
-            command.pre_exec(move || {
-                libc::signal(libc::SIGINT, disposition);
+            command.pre_exec(|| {
+                let none = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_CORE, &none);
                 Ok(())
             });
         }
-        let out = command.output().expect("run prov");
-        assert_eq!(out.status.code(), code, "{}", stderr(&out));
-        let (_, v) = record(&d.join("s"));
-        assert_eq!(v["exit"]["signal"].as_i64(), signal.map(i64::from));
+        let mut child = command.spawn().expect("run prov");
+        // prov pauses once the placeholder record exists.
+        let runs = d.join("s/runs");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fs::read_dir(&runs).map_or(true, |mut r| r.next().is_none()) {
+            assert!(Instant::now() < deadline, "no placeholder record");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: plain FFI call with a live child's pid.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
+        // Let the signal land before prov goes on.
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(&go, "").unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(sig), "{status:?}");
+        assert!(!d.join("ran").exists(), "the command ran");
+        let left: Vec<_> = fs::read_dir(&runs).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }
 

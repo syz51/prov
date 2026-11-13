@@ -190,9 +190,11 @@ prov run --in data/train.csv --in scripts/train.py --out results/metrics.json --
    resolved executable.
 3. Runs the command with inherited stdin; stdout and stderr pass through to the terminal
    and are hashed, counted and stored next to the record (`--no-streams` keeps only hash and
-   count). The command sees pipes, not a terminal. While it runs, `prov` ignores `Ctrl-C`
+   count). The command sees pipes, not a terminal. While it runs, `prov` survives `Ctrl-C`
    and `Ctrl-\` (SIGINT, SIGQUIT), which still reach the command, so an interrupted run is
-   recorded with its signal.
+   recorded with its signal. One that comes after `prov` reserves the record but before the
+   command starts keeps the command from starting; `prov` then removes the record and exits
+   by that signal.
 4. Re-hashes the inputs (`input-modified`, error, when the run changed one) and hashes the
    outputs (`output-missing`, `output-unreadable`: error; `output-unchanged`: warn).
 5. Writes `<state_dir>/runs/<UTC time>-<name>.json` atomically and prints its path to stderr.
@@ -384,7 +386,7 @@ record.
   "id": "20261107T030000.123Z-train",
   "status": "complete",
   "name": "train",
-  "tool": "prov", "tool_version": "0.1.3",
+  "tool": "prov", "tool_version": "0.1.4",
   "argv": ["uv", "run", "--no-project", "--with", "numpy==2.3.4", "python", "train.py"],
   "argv_redacted": [],
   "cwd": "/abs/path/project",

@@ -1,6 +1,6 @@
 [package]
 name = "prov"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.99"
 description = "Provenance for research artifacts and experiment runs: content manifests, duplicate detection, run records, reruns and lineage"

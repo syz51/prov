@@ -915,44 +915,99 @@ fn placeholder(id: &str) -> String {
     )
 }
 
-/// While alive, prov ignores the terminal's interrupt and quit signals, so Ctrl-C stops the
-/// command (which shares the terminal's process group) while prov still writes its record.
-///
-/// It must exist before the command starts: a signal that arrives between the spawn and a later
-/// guard would kill prov. The command must not inherit the ignored signals, so `restore_in`
-/// gives it back the dispositions prov itself started with.
-struct IgnoreInterrupts {
-    #[cfg(unix)]
-    previous: [(libc::c_int, libc::sighandler_t); 2],
+/// The interrupt or quit signal that reached prov while a `CatchInterrupts` guard was alive, or
+/// 0. A forked child gets its own copy, which its own handler may also set.
+#[cfg(unix)]
+static PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn note_signal(sig: libc::c_int) {
+    // A lock-free atomic store is async-signal-safe; the handler does nothing else.
+    PENDING.store(sig, std::sync::atomic::Ordering::Relaxed);
 }
 
-impl IgnoreInterrupts {
+/// While alive, prov catches the terminal's interrupt and quit signals (SIGINT, SIGQUIT) and
+/// only notes them, so Ctrl-C stops the command (which shares the terminal's process group)
+/// while prov still writes its record. A signal that prov started out ignoring, as under
+/// `nohup`, stays ignored.
+///
+/// It must exist before the placeholder record: from then until the command starts, a signal
+/// that killed prov would leave an incomplete record for a command that never ran. It ends
+/// once the command and its streams are done, so a later signal still kills prov and leaves
+/// the placeholder to mark the run as interrupted. A signal that reaches prov before the fork, or the forked child
+/// before exec, keeps the command from starting (see `restore_in`); `run` then removes the
+/// placeholder and dies by that signal. A Ctrl-C reaches both, as they share the terminal's
+/// process group. A signal sent to prov alone after the fork counts as one during the run.
+/// Caught signals reset to their default at exec, and `restore_in` gives the command back the
+/// dispositions prov started with.
+struct CatchInterrupts {
+    #[cfg(unix)]
+    previous: [(libc::c_int, libc::sigaction); 2],
+}
+
+impl CatchInterrupts {
     #[cfg(unix)]
     fn new() -> Self {
+        use std::ptr;
+        PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
         let previous = [libc::SIGINT, libc::SIGQUIT].map(|sig| {
-            // SAFETY: installing SIG_IGN touches no Rust state; the previous disposition is
-            // restored in Drop.
-            (sig, unsafe { libc::signal(sig, libc::SIG_IGN) })
+            // SAFETY: `sigaction` is plain data, for which all zeroes is a valid value. The
+            // calls cannot fail: the signal numbers are valid and catchable, and the pointers
+            // are valid or null.
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, ptr::null(), &mut old);
+                // Read first and install only if not ignored, so an ignored signal is never
+                // caught, not even briefly.
+                if old.sa_sigaction != libc::SIG_IGN {
+                    let mut catch: libc::sigaction = std::mem::zeroed();
+                    catch.sa_sigaction = note_signal as *const () as libc::sighandler_t;
+                    // Restart interrupted system calls, so the handler disturbs no I/O.
+                    catch.sa_flags = libc::SA_RESTART;
+                    libc::sigemptyset(&mut catch.sa_mask);
+                    libc::sigaction(sig, &catch, ptr::null_mut());
+                }
+                (sig, old)
+            }
         });
-        IgnoreInterrupts { previous }
+        CatchInterrupts { previous }
     }
 
     #[cfg(not(unix))]
     fn new() -> Self {
-        IgnoreInterrupts {}
+        CatchInterrupts {}
     }
 
-    /// Makes `command` start with the dispositions that prov had before this guard.
+    /// The signal noted since this guard was created, if any.
+    fn pending(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            let sig = PENDING.load(std::sync::atomic::Ordering::Relaxed);
+            (sig != 0).then_some(sig)
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Makes `command` start with the dispositions that prov had before this guard, and keeps
+    /// it from starting when a signal was noted before it could exec.
     fn restore_in(&self, command: &mut Command) {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             let previous = self.previous;
             // SAFETY: the closure runs in the forked child before exec and calls only
-            // `signal`, which is async-signal-safe; it allocates nothing and takes no lock.
+            // `sigaction` and an atomic load, which are async-signal-safe; it allocates
+            // nothing (an OS error holds only its code) and takes no lock.
             unsafe {
                 command.pre_exec(move || {
-                    restore(previous);
+                    restore(&previous);
+                    // The child's copy of PENDING holds a signal that reached prov before the
+                    // fork, or this child before the line above; either stops the command. A
+                    // later signal meets the restored disposition.
+                    if PENDING.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                        return Err(io::Error::from_raw_os_error(libc::EINTR));
+                    }
                     Ok(())
                 });
             }
@@ -963,19 +1018,17 @@ impl IgnoreInterrupts {
 }
 
 #[cfg(unix)]
-fn restore(previous: [(libc::c_int, libc::sighandler_t); 2]) {
-    for (sig, handler) in previous {
-        if handler != libc::SIG_ERR {
-            // SAFETY: restores the disposition returned by `signal` in `IgnoreInterrupts::new`.
-            unsafe { libc::signal(sig, handler) };
-        }
+fn restore(previous: &[(libc::c_int, libc::sigaction); 2]) {
+    for (sig, old) in previous {
+        // SAFETY: reinstalls a disposition that `sigaction` returned in `CatchInterrupts::new`.
+        unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
     }
 }
 
-impl Drop for IgnoreInterrupts {
+impl Drop for CatchInterrupts {
     fn drop(&mut self) {
         #[cfg(unix)]
-        restore(self.previous);
+        restore(&self.previous);
     }
 }
 
@@ -1084,6 +1137,8 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     );
     let mut id = format!("{stamp}-{name}");
     let mut n = 1;
+    // Catch interrupts before the placeholder exists, so that none can leave it incomplete.
+    let interrupts = CatchInterrupts::new();
     let record_path = loop {
         let p = runs.join(format!("{id}.json"));
         match OpenOptions::new().write(true).create_new(true).open(&p) {
@@ -1099,10 +1154,16 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
             Err(e) => return Err(e).with_context(|| format!("cannot create {}", p.display())),
         }
     };
+    // Test hook, absent from release builds: wait here, with the placeholder written, until the
+    // named file exists, so a test can send a signal before the command starts.
+    #[cfg(debug_assertions)]
+    if let Some(go) = std::env::var_os("PROV_TEST_PAUSE_UNTIL") {
+        while !Path::new(&go).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let streams = |ext: &str| spec.store_streams.then(|| format!("{id}.{ext}"));
     let (out_rel, err_rel) = (streams("stdout"), streams("stderr"));
-    // Ignore interrupts before the command exists, so that none can arrive unguarded.
-    let interrupts = IgnoreInterrupts::new();
     // Until the command starts, a failure leaves nothing behind.
     let start = || -> Result<(std::process::Child, Option<File>, Option<File>)> {
         let open = |rel: &Option<String>| -> Result<Option<File>> {
@@ -1136,6 +1197,19 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
                 .flatten()
             {
                 let _ = fs::remove_file(runs.join(p));
+            }
+            if let Some(sig) = interrupts.pending() {
+                // The command never started. Die by the signal, as prov would have without
+                // the guard, now that no record is left behind.
+                drop(interrupts);
+                #[cfg(unix)]
+                // SAFETY: `raise` touches no Rust state.
+                unsafe {
+                    libc::raise(sig)
+                };
+                return Err(e.context(format!(
+                    "interrupted by signal {sig} before the command started"
+                )));
             }
             return Err(e);
         }
