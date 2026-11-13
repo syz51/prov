@@ -931,8 +931,10 @@ extern "C" fn note_signal(sig: libc::c_int) {
 /// while prov still writes its record. A signal that prov started out ignoring, as under
 /// `nohup`, stays ignored.
 ///
-/// It must exist before the placeholder record: from then on, a signal that killed prov would
-/// leave an incomplete record. A signal that reaches prov before the fork, or the forked child
+/// It must exist before the placeholder record: from then until the command starts, a signal
+/// that killed prov would leave an incomplete record for a command that never ran. It ends
+/// once the command and its streams are done, so a later signal still kills prov and leaves
+/// the placeholder to mark the run as interrupted. A signal that reaches prov before the fork, or the forked child
 /// before exec, keeps the command from starting (see `restore_in`); `run` then removes the
 /// placeholder and dies by that signal. A Ctrl-C reaches both, as they share the terminal's
 /// process group. A signal sent to prov alone after the fork counts as one during the run.
