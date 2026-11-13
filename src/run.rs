@@ -1032,6 +1032,32 @@ impl Drop for CatchInterrupts {
     }
 }
 
+/// Ends a run that failed before its command started: removes the `files` it made in `runs`, so
+/// nothing is left behind, then dies by the signal that `interrupts` noted, if any, as prov
+/// would have without the guard. Returns the error to report otherwise.
+fn abandon(
+    e: anyhow::Error,
+    runs: &Path,
+    files: impl IntoIterator<Item = String>,
+    interrupts: CatchInterrupts,
+) -> anyhow::Error {
+    for f in files {
+        let _ = fs::remove_file(runs.join(f));
+    }
+    let Some(sig) = interrupts.pending() else {
+        return e;
+    };
+    drop(interrupts);
+    #[cfg(unix)]
+    // SAFETY: `raise` touches no Rust state.
+    unsafe {
+        libc::raise(sig)
+    };
+    e.context(format!(
+        "interrupted by signal {sig} before the command started"
+    ))
+}
+
 pub struct RunOutcome {
     pub record: RunRecord,
     pub path: PathBuf,
@@ -1143,25 +1169,32 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
         let p = runs.join(format!("{id}.json"));
         match OpenOptions::new().write(true).create_new(true).open(&p) {
             Ok(mut f) => {
-                f.write_all(placeholder(&id).as_bytes())
-                    .with_context(|| format!("cannot write {}", p.display()))?;
+                // Test hook, absent from release builds: wait here, with the placeholder
+                // created but not yet written, until the named file exists, so a test can send
+                // a signal before the command starts.
+                #[cfg(debug_assertions)]
+                if let Some(go) = std::env::var_os("PROV_TEST_PAUSE_UNTIL") {
+                    while !Path::new(&go).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                if let Err(e) = f.write_all(placeholder(&id).as_bytes()) {
+                    drop(f);
+                    let e = anyhow::Error::new(e).context(format!("cannot write {}", p.display()));
+                    return Err(abandon(e, &runs, Some(format!("{id}.json")), interrupts));
+                }
                 break p;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 n += 1;
                 id = format!("{stamp}-{name}-{n}");
             }
-            Err(e) => return Err(e).with_context(|| format!("cannot create {}", p.display())),
+            Err(e) => {
+                let e = anyhow::Error::new(e).context(format!("cannot create {}", p.display()));
+                return Err(abandon(e, &runs, None, interrupts));
+            }
         }
     };
-    // Test hook, absent from release builds: wait here, with the placeholder written, until the
-    // named file exists, so a test can send a signal before the command starts.
-    #[cfg(debug_assertions)]
-    if let Some(go) = std::env::var_os("PROV_TEST_PAUSE_UNTIL") {
-        while !Path::new(&go).exists() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
     let streams = |ext: &str| spec.store_streams.then(|| format!("{id}.{ext}"));
     let (out_rel, err_rel) = (streams("stdout"), streams("stderr"));
     // Until the command starts, a failure leaves nothing behind.
@@ -1192,26 +1225,8 @@ pub fn execute(spec: &RunSpec) -> Result<RunOutcome> {
     let (mut child, out_file, err_file) = match start() {
         Ok(started) => started,
         Err(e) => {
-            for p in [Some(format!("{id}.json")), out_rel, err_rel]
-                .into_iter()
-                .flatten()
-            {
-                let _ = fs::remove_file(runs.join(p));
-            }
-            if let Some(sig) = interrupts.pending() {
-                // The command never started. Die by the signal, as prov would have without
-                // the guard, now that no record is left behind.
-                drop(interrupts);
-                #[cfg(unix)]
-                // SAFETY: `raise` touches no Rust state.
-                unsafe {
-                    libc::raise(sig)
-                };
-                return Err(e.context(format!(
-                    "interrupted by signal {sig} before the command started"
-                )));
-            }
-            return Err(e);
+            let files = [Some(format!("{id}.json")), out_rel, err_rel];
+            return Err(abandon(e, &runs, files.into_iter().flatten(), interrupts));
         }
     };
     let after_start = |e: anyhow::Error| e.context(AfterStart { record: None });
